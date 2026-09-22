@@ -48,7 +48,7 @@ detect_os() {
   [[ -f /etc/os-release ]] || err "Cannot detect OS: /etc/os-release is missing."
   . /etc/os-release
   OS_ID="${ID,,}"
-  OS_LIKE="${ID_LIKE,,-}"
+  OS_LIKE="${ID_LIKE:-}"
 
   if have apt-get; then PKG=apt
   elif have dnf; then PKG=dnf
