@@ -1,142 +1,43 @@
 #!/usr/bin/env bash
-#
-# k3s-manager
-#
-# Cross-distro K3s cluster management.
-#
-# Supports:
-#   - Debian / Ubuntu / Raspberry Pi OS
-#   - RHEL / CentOS / Rocky / Alma / Fedora
-#   - openSUSE / SLES
-#   - Arch
-#   - Alpine
-#
-# Features:
-#   - Single master
-#   - HA masters with embedded etcd
-#   - Workers
-#   - Explicit network-interface selection
-#   - en0 / eth0 join information
-#   - Node management
-#   - Automatic failover watchdog
-#   - Rancher installation
-#   - Boot management
-#
-# Example:
-#   sudo k3s-manager install master --interface eth0 --worker
-#
-#   sudo k3s-manager install worker \
-#       --server https://192.168.1.123:6443 \
-#       --token TOKEN \
-#       --interface eth0
-#
-
-set -euo pipefail
+set -Eeuo pipefail
 IFS=$'\n\t'
 
-# ==============================================================================
-# PATHS
-# ==============================================================================
-
+VERSION="2.0.0"
 CONFIG_DIR="/etc/k3s-manager"
 CONFIG_FILE="${CONFIG_DIR}/config.env"
-
 LOG_FILE="/var/log/k3s-manager.log"
-
-SNAPSHOT_DIR="/var/lib/k3s-manager/snapshots"
-
+K3S_TOKEN_FILE="/var/lib/rancher/k3s/server/node-token"
 KUBECONFIG_PATH="/etc/rancher/k3s/k3s.yaml"
-
-WATCHDOG_SCRIPT="/usr/local/bin/k3s-manager-watchdog.sh"
-WATCHDOG_SERVICE="/etc/systemd/system/k3s-manager-watchdog.service"
-WATCHDOG_TIMER="/etc/systemd/system/k3s-manager-watchdog.timer"
-
-# ==============================================================================
-# LOGGING / HELPERS
-# ==============================================================================
 
 log() {
     mkdir -p "$(dirname "$LOG_FILE")"
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG_FILE"
+    printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" | tee -a "$LOG_FILE"
 }
 
-err() {
+die() {
     echo "ERROR: $*" >&2
     exit 1
+}
+
+need_root() {
+    [[ "${EUID}" -eq 0 ]] || die "Run this command with sudo."
 }
 
 have() {
     command -v "$1" >/dev/null 2>&1
 }
 
-need_root() {
-    [[ $EUID -eq 0 ]] ||
-        err "This command must be run as root. Use sudo."
-}
-
 ensure_config_dir() {
-    mkdir -p "$CONFIG_DIR"
+    install -d -m 0755 "$CONFIG_DIR"
 }
 
-# ==============================================================================
-# CONFIGURATION
-# ==============================================================================
-
-save_config() {
-    ensure_config_dir
-
-    cat > "${CONFIG_FILE}.tmp" <<EOF
-K3SMGR_ROLE=${K3SMGR_ROLE:-}
-K3SMGR_INTERFACE=${K3SMGR_INTERFACE:-}
-K3SMGR_NODE_IP=${K3SMGR_NODE_IP:-}
-K3SMGR_SERVER_URL=${K3SMGR_SERVER_URL:-}
-EOF
-
-    mv -f "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
-}
-
-load_config() {
-    if [[ -f "$CONFIG_FILE" ]]; then
-        # shellcheck disable=SC1090
-        . "$CONFIG_FILE"
-    fi
-}
-
-write_role_config() {
-    local role="$1"
-    local interface="${2:-}"
-    local node_ip="${3:-}"
-    local server_url="${4:-}"
-
-    ensure_config_dir
-
-    cat > "${CONFIG_FILE}.tmp" <<EOF
-K3SMGR_ROLE=${role}
-K3SMGR_INTERFACE=${interface}
-K3SMGR_NODE_IP=${node_ip}
-K3SMGR_SERVER_URL=${server_url}
-EOF
-
-    chmod 600 "${CONFIG_FILE}.tmp"
-    mv -f "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
-}
-
-# ==============================================================================
-# OS DETECTION
-# ==============================================================================
-
-detect_os() {
-    [[ -f /etc/os-release ]] ||
-        err "/etc/os-release does not exist."
-
+load_os() {
+    [[ -r /etc/os-release ]] || die "/etc/os-release not found."
     # shellcheck disable=SC1091
     . /etc/os-release
 
-    OS_ID="${ID,,}"
-
-    # ID_LIKE is optional.
-    OS_LIKE="${ID_LIKE:-}"
-    OS_LIKE="${OS_LIKE,,}"
+    OS_ID="${ID:-unknown}"
+    OS_ID_LIKE="${ID_LIKE:-}"
 
     if have apt-get; then
         PKG="apt"
@@ -151,7 +52,7 @@ detect_os() {
     elif have apk; then
         PKG="apk"
     else
-        err "No supported package manager found."
+        die "Unsupported package manager."
     fi
 
     if have systemctl && systemctl --version >/dev/null 2>&1; then
@@ -159,145 +60,131 @@ detect_os() {
     elif have rc-service; then
         INIT="openrc"
     else
-        err "K3s requires systemd or OpenRC."
+        die "K3s requires systemd or OpenRC."
+    fi
+}
+
+save_config() {
+    ensure_config_dir
+    local role="${1:-}" iface="${2:-}" ip="${3:-}" server="${4:-}"
+
+    umask 077
+    cat > "${CONFIG_FILE}.tmp" <<CFG
+K3SMGR_ROLE=$(printf '%q' "$role")
+K3SMGR_INTERFACE=$(printf '%q' "$iface")
+K3SMGR_NODE_IP=$(printf '%q' "$ip")
+K3SMGR_SERVER_URL=$(printf '%q' "$server")
+CFG
+
+    chmod 600 "${CONFIG_FILE}.tmp"
+    mv -f "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+}
+
+load_config() {
+    if [[ -f "$CONFIG_FILE" ]]; then
+        # shellcheck disable=SC1090
+        . "$CONFIG_FILE"
+    fi
+}
+
+iface_exists() {
+    ip link show dev "$1" >/dev/null 2>&1
+}
+
+iface_ip() {
+    ip -4 -o addr show dev "$1" scope global 2>/dev/null |
+        awk 'NR==1 {split($4,a,"/"); print a[1]}'
+}
+
+best_ip() {
+    local value
+    value="$(ip -4 route get 1.1.1.1 2>/dev/null |
+        awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' || true)"
+
+    if [[ -n "$value" ]]; then
+        printf '%s\n' "$value"
+        return 0
     fi
 
-    log "Detected distro=${OS_ID} package-manager=${PKG} init=${INIT}"
-}
-
-# ==============================================================================
-# NETWORKING
-# ==============================================================================
-
-interface_exists() {
-    ip link show "$1" >/dev/null 2>&1
-}
-
-interface_ipv4() {
-    local iface="$1"
-
-    ip -4 addr show dev "$iface" 2>/dev/null |
-        awk '/inet / {
-            split($2,a,"/");
-            print a[1];
-            exit
-        }'
-}
-
-default_ip() {
-    ip -4 route get 1.1.1.1 2>/dev/null |
-        awk '{
-            for(i=1;i<=NF;i++)
-                if($i=="src")
-                    print $(i+1)
-        }' |
-        head -n1
-}
-
-get_interface_ip() {
-    local iface="$1"
-    local ipaddr
-
-    ipaddr="$(interface_ipv4 "$iface" || true)"
-
-    [[ -n "$ipaddr" ]] ||
-        err "Interface '$iface' has no IPv4 address."
-
-    echo "$ipaddr"
-}
-
-get_best_ip() {
-    local ipaddr
-
-    ipaddr="$(default_ip || true)"
-
-    if [[ -n "$ipaddr" ]]; then
-        echo "$ipaddr"
-        return
-    fi
-
-    hostname -I 2>/dev/null |
-        awk '{print $1}'
+    hostname -I 2>/dev/null | awk '{print $1}'
 }
 
 network_info() {
-    echo "=== NETWORK INTERFACES ==="
-    echo
+    echo "=== K3S NETWORK INFORMATION ==="
+    printf '%-10s %-18s %-10s\n' "INTERFACE" "IPV4" "STATE"
 
-    printf "%-12s %-18s %-10s\n" "INTERFACE" "IPv4" "STATE"
-    printf "%-12s %-18s %-10s\n" "---------" "----" "-----"
+    local found=0
+    local iface state ipaddr
 
-    local iface
     for iface in en0 eth0 wlan0 wlan1; do
-        if interface_exists "$iface"; then
-            local ipaddr
-            local state
-
-            ipaddr="$(interface_ipv4 "$iface" || true)"
+        if iface_exists "$iface"; then
+            found=1
+            ipaddr="$(iface_ip "$iface" || true)"
             state="$(cat "/sys/class/net/${iface}/operstate" 2>/dev/null || echo unknown)"
-
-            printf "%-12s %-18s %-10s\n" \
+            printf '%-10s %-18s %-10s\n' \
                 "$iface" \
                 "${ipaddr:-none}" \
                 "$state"
         fi
     done
 
+    if [[ "$found" -eq 0 ]]; then
+        ip -br addr
+    fi
+
     echo
     echo "=== DEFAULT ROUTE ==="
     ip -4 route show default 2>/dev/null || true
 
     echo
-    echo "=== ROUTED IP ==="
-    echo "$(get_best_ip)"
+    echo "=== DEFAULT ROUTED IP ==="
+    echo "$(best_ip)"
 }
 
-# ==============================================================================
-# K3S NETWORK ARGUMENTS
-# ==============================================================================
+validate_interface() {
+    local iface="$1"
+
+    [[ -n "$iface" ]] || return 0
+
+    iface_exists "$iface" ||
+        die "Network interface '$iface' does not exist."
+
+    local ipaddr
+    ipaddr="$(iface_ip "$iface" || true)"
+
+    [[ -n "$ipaddr" ]] ||
+        die "Network interface '$iface' has no global IPv4 address."
+
+    printf '%s\n' "$ipaddr"
+}
 
 build_network_args() {
     local iface="${1:-}"
-
     NETWORK_ARGS=()
 
     if [[ -n "$iface" ]]; then
-        interface_exists "$iface" ||
-            err "Network interface '$iface' does not exist."
-
         local ipaddr
-        ipaddr="$(get_interface_ip "$iface")"
+        ipaddr="$(validate_interface "$iface")"
 
-        NETWORK_ARGS+=(
-            "--node-ip"
-            "$ipaddr"
-            "--advertise-address"
-            "$ipaddr"
-            "--flannel-iface"
-            "$iface"
+        NETWORK_ARGS=(
+            "--node-ip" "$ipaddr"
+            "--advertise-address" "$ipaddr"
+            "--flannel-iface" "$iface"
         )
-
-        log "K3s network interface: $iface"
-        log "K3s node IP: $ipaddr"
     fi
 }
 
-# ==============================================================================
-# PREREQUISITES
-# ==============================================================================
-
 install_prereqs() {
     need_root
+    load_os
 
-    log "Installing prerequisites for ${PKG}..."
+    log "Detected distro=${OS_ID} package-manager=${PKG} init=${INIT}"
+    log "Installing prerequisites..."
 
     case "$PKG" in
-
         apt)
             export DEBIAN_FRONTEND=noninteractive
-
-            apt-get update -y
-
+            apt-get update
             apt-get install -y \
                 curl \
                 ca-certificates \
@@ -305,538 +192,500 @@ install_prereqs() {
                 nfs-common \
                 apparmor \
                 apparmor-utils \
-                socat \
-                conntrack
+                conntrack \
+                socat
             ;;
-
         dnf)
-            dnf install -y \
-                curl \
-                iscsi-initiator-utils \
-                nfs-utils \
-                socat \
-                conntrack-tools
-
-            systemctl enable --now iscsid 2>/dev/null || true
+            dnf install -y curl ca-certificates nfs-utils socat conntrack-tools
+            if have iscsiadm; then
+                systemctl enable --now iscsid 2>/dev/null || true
+            fi
             ;;
-
         yum)
-            yum install -y \
-                curl \
-                iscsi-initiator-utils \
-                nfs-utils \
-                socat \
-                conntrack-tools
-
-            systemctl enable --now iscsid 2>/dev/null || true
+            yum install -y curl ca-certificates nfs-utils socat conntrack-tools
+            if have iscsiadm; then
+                systemctl enable --now iscsid 2>/dev/null || true
+            fi
             ;;
-
         zypper)
-            zypper --non-interactive install \
-                curl \
-                open-iscsi \
-                nfs-client \
-                socat \
-                conntrack-tools
-
-            systemctl enable --now iscsid 2>/dev/null || true
+            zypper --non-interactive install curl ca-certificates nfs-client socat conntrack-tools
             ;;
-
         pacman)
-            pacman -Sy --noconfirm \
-                curl \
-                open-iscsi \
-                nfs-utils \
-                socat \
-                conntrack-tools
-
-            systemctl enable --now iscsid 2>/dev/null || true
+            pacman -Sy --noconfirm curl ca-certificates nfs-utils socat conntrack-tools
             ;;
-
         apk)
-            apk add --no-cache \
-                curl \
-                open-iscsi \
-                nfs-utils \
-                socat \
-                conntrack-tools
-
-            rc-update add iscsid default 2>/dev/null || true
-            rc-service iscsid start 2>/dev/null || true
+            apk add --no-cache curl ca-certificates nfs-utils socat conntrack-tools
             ;;
-
     esac
 }
 
-# ==============================================================================
-# KUBECTL
-# ==============================================================================
-
 kctl() {
-    [[ -f "$KUBECONFIG_PATH" ]] ||
-        err "No kubeconfig found at $KUBECONFIG_PATH."
-
-    KUBECONFIG="$KUBECONFIG_PATH" k3s kubectl "$@"
+    [[ -x /usr/local/bin/k3s ]] || die "K3s is not installed."
+    [[ -f "$KUBECONFIG_PATH" ]] || die "Kubeconfig not found: $KUBECONFIG_PATH"
+    KUBECONFIG="$KUBECONFIG_PATH" /usr/local/bin/k3s kubectl "$@"
 }
 
-# ==============================================================================
-# INSTALL
-# ==============================================================================
+wait_for_k3s() {
+    local tries=0
+    local max_tries=60
 
-usage_install() {
-    cat <<'EOF'
+    while (( tries < max_tries )); do
+        if systemctl is-active --quiet k3s 2>/dev/null; then
+            return 0
+        fi
+        sleep 2
+        tries=$((tries + 1))
+    done
 
-INSTALL COMMANDS
-
-Master:
-
-  k3s-manager install master [OPTIONS]
-
-Options:
-
-  --ha
-      Enable embedded-etcd cluster initialization.
-
-  --worker
-      Allow workloads to run on this master.
-
-  --interface eth0
-      Force K3s to use eth0 for node networking.
-
-  --token TOKEN
-      Use a specific cluster token.
-
-Worker:
-
-  k3s-manager install worker \
-      --server https://MASTER:6443 \
-      --token TOKEN \
-      [--interface eth0]
-
-Additional HA master:
-
-  k3s-manager install join-master \
-      --server https://MASTER:6443 \
-      --token TOKEN \
-      [--interface eth0]
-
-EOF
+    return 1
 }
 
-cmd_install() {
+install_server() {
     need_root
-    detect_os
+
+    local cluster_init=0
+    local allow_workloads=0
+    local token=""
+    local iface=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --ha|--cluster-init)
+                cluster_init=1
+                shift
+                ;;
+            --worker|--allow-workloads)
+                allow_workloads=1
+                shift
+                ;;
+            --token)
+                [[ $# -ge 2 ]] || die "--token requires a value."
+                token="$2"
+                shift 2
+                ;;
+            --interface)
+                [[ $# -ge 2 ]] || die "--interface requires a value."
+                iface="$2"
+                shift 2
+                ;;
+            --)
+                shift
+                break
+                ;;
+            *)
+                die "Unknown master option: $1"
+                ;;
+        esac
+    done
+
     install_prereqs
+    build_network_args "$iface"
 
-    local subrole="${1:-}"
-    shift || true
+    local -a args
+    args=("server")
 
-    local ha=false
-    local worker=false
+    if [[ "$cluster_init" -eq 1 ]]; then
+        args+=("--cluster-init")
+    fi
+
+    if [[ -n "$token" ]]; then
+        args+=("--token" "$token")
+    fi
+
+    if [[ "${#NETWORK_ARGS[@]}" -gt 0 ]]; then
+        args+=("${NETWORK_ARGS[@]}")
+    fi
+
+    log "Installing K3s server..."
+
+    if [[ -x /usr/local/bin/k3s ]]; then
+        log "K3s binary already exists; using installer for service reconciliation."
+    fi
+
+    local exec_string=""
+    local arg
+    for arg in "${args[@]}"; do
+        exec_string+=" $(printf '%q' "$arg")"
+    done
+    exec_string="${exec_string# }"
+
+    curl -sfL https://get.k3s.io |
+        INSTALL_K3S_EXEC="$exec_string" \
+        K3S_TOKEN="${token}" \
+        sh -
+
+    if [[ "$INIT" == "systemd" ]]; then
+        systemctl enable k3s
+        systemctl restart k3s
+    fi
+
+    local node_ip
+    if [[ -n "$iface" ]]; then
+        node_ip="$(validate_interface "$iface")"
+    else
+        node_ip="$(best_ip)"
+    fi
+
+    [[ -n "$node_ip" ]] || die "Could not determine the server IPv4 address."
+
+    local server_url="https://${node_ip}:6443"
+    save_config "master" "$iface" "$node_ip" "$server_url"
+
+    if [[ "$allow_workloads" -eq 1 ]]; then
+        sleep 5
+        local node
+        node="$(hostname)"
+        kctl taint nodes "$node" \
+            node-role.kubernetes.io/control-plane:NoSchedule- \
+            node-role.kubernetes.io/master:NoSchedule- \
+            2>/dev/null || true
+    fi
+
+    log "K3s master installed."
+    log "Primary API URL: ${server_url}"
+    log "Run 'sudo k3s-manager token' to get join information."
+}
+
+install_worker() {
+    need_root
+
     local server=""
     local token=""
     local iface=""
 
     while [[ $# -gt 0 ]]; do
-
         case "$1" in
-
-            --ha)
-                ha=true
-                shift
-                ;;
-
-            --worker)
-                worker=true
-                shift
-                ;;
-
-            --interface)
-                [[ $# -ge 2 ]] ||
-                    err "--interface requires an interface name."
-
-                iface="$2"
-                shift 2
-                ;;
-
             --server)
-                [[ $# -ge 2 ]] ||
-                    err "--server requires a URL."
-
+                [[ $# -ge 2 ]] || die "--server requires a URL."
                 server="$2"
                 shift 2
                 ;;
-
             --token)
-                [[ $# -ge 2 ]] ||
-                    err "--token requires a token."
-
+                [[ $# -ge 2 ]] || die "--token requires a value."
                 token="$2"
                 shift 2
                 ;;
-
-            *)
-                err "Unknown option: $1"
+            --interface)
+                [[ $# -ge 2 ]] || die "--interface requires an interface."
+                iface="$2"
+                shift 2
                 ;;
-
+            *)
+                die "Unknown worker option: $1"
+                ;;
         esac
-
     done
 
-    if [[ -n "$iface" ]]; then
-        interface_exists "$iface" ||
-            err "Interface '$iface' does not exist."
+    [[ -n "$server" ]] || die "worker requires --server."
+    [[ -n "$token" ]] || die "worker requires --token."
 
-        get_interface_ip "$iface" >/dev/null
-    fi
-
+    install_prereqs
     build_network_args "$iface"
 
-    case "$subrole" in
+    local -a args
+    args=("agent")
 
+    if [[ "${#NETWORK_ARGS[@]}" -gt 0 ]]; then
+        args+=("${NETWORK_ARGS[@]}")
+    fi
+
+    local exec_string=""
+    local arg
+    for arg in "${args[@]}"; do
+        exec_string+=" $(printf '%q' "$arg")"
+    done
+    exec_string="${exec_string# }"
+
+    log "Joining worker to ${server}..."
+
+    curl -sfL https://get.k3s.io |
+        K3S_URL="$server" \
+        K3S_TOKEN="$token" \
+        INSTALL_K3S_EXEC="$exec_string" \
+        sh -
+
+    if [[ "$INIT" == "systemd" ]]; then
+        systemctl enable k3s-agent
+        systemctl restart k3s-agent
+    fi
+
+    local node_ip
+    if [[ -n "$iface" ]]; then
+        node_ip="$(validate_interface "$iface")"
+    else
+        node_ip="$(best_ip)"
+    fi
+
+    save_config "worker" "$iface" "$node_ip" "$server"
+    log "Worker installed successfully."
+}
+
+install_join_master() {
+    need_root
+
+    local server=""
+    local token=""
+    local iface=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --server)
+                [[ $# -ge 2 ]] || die "--server requires a URL."
+                server="$2"
+                shift 2
+                ;;
+            --token)
+                [[ $# -ge 2 ]] || die "--token requires a value."
+                token="$2"
+                shift 2
+                ;;
+            --interface)
+                [[ $# -ge 2 ]] || die "--interface requires an interface."
+                iface="$2"
+                shift 2
+                ;;
+            *)
+                die "Unknown join-master option: $1"
+                ;;
+        esac
+    done
+
+    [[ -n "$server" ]] || die "join-master requires --server."
+    [[ -n "$token" ]] || die "join-master requires --token."
+
+    install_prereqs
+    build_network_args "$iface"
+
+    local -a args
+    args=("server" "--server" "$server" "--token" "$token")
+
+    if [[ "${#NETWORK_ARGS[@]}" -gt 0 ]]; then
+        args+=("${NETWORK_ARGS[@]}")
+    fi
+
+    local exec_string=""
+    local arg
+    for arg in "${args[@]}"; do
+        exec_string+=" $(printf '%q' "$arg")"
+    done
+    exec_string="${exec_string# }"
+
+    log "Joining HA server to ${server}..."
+
+    curl -sfL https://get.k3s.io |
+        INSTALL_K3S_EXEC="$exec_string" \
+        K3S_TOKEN="$token" \
+        sh -
+
+    if [[ "$INIT" == "systemd" ]]; then
+        systemctl enable k3s
+        systemctl restart k3s
+    fi
+
+    local node_ip
+    if [[ -n "$iface" ]]; then
+        node_ip="$(validate_interface "$iface")"
+    else
+        node_ip="$(best_ip)"
+    fi
+
+    save_config "master" "$iface" "$node_ip" "$server"
+    log "HA master joined successfully."
+}
+
+cmd_install() {
+    local role="${1:-}"
+    shift || true
+
+    case "$role" in
         master)
-
-            local -a exec_args
-            exec_args=("server")
-
-            if $ha; then
-                exec_args+=("--cluster-init")
-            fi
-
-            if [[ -n "$token" ]]; then
-                exec_args+=("--token" "$token")
-            fi
-
-            if [[ ${#NETWORK_ARGS[@]} -gt 0 ]]; then
-                exec_args+=("${NETWORK_ARGS[@]}")
-            fi
-
-            log "Installing K3s master..."
-
-            curl -sfL https://get.k3s.io |
-                INSTALL_K3S_EXEC="${exec_args[*]}" sh -
-
-            local master_ip
-            if [[ -n "$iface" ]]; then
-                master_ip="$(get_interface_ip "$iface")"
-            else
-                master_ip="$(get_best_ip)"
-            fi
-
-            write_role_config \
-                "master" \
-                "$iface" \
-                "$master_ip" \
-                "https://${master_ip}:6443"
-
-            if $worker; then
-                untaint_self
-            fi
-
-            if [[ "$INIT" == "systemd" ]]; then
-                systemctl enable k3s
-            else
-                rc-update add k3s default 2>/dev/null || true
-            fi
-
-            log "Master installed successfully."
-            log "Master IP: ${master_ip}"
-            log "K3s API: https://${master_ip}:6443"
-
+            install_server "$@"
             ;;
-
+        worker|agent)
+            install_worker "$@"
+            ;;
         join-master)
-
-            [[ -n "$server" ]] ||
-                err "join-master requires --server."
-
-            [[ -n "$token" ]] ||
-                err "join-master requires --token."
-
-            local -a join_args
-            join_args=("server" "--server" "$server" "--token" "$token")
-
-            if [[ ${#NETWORK_ARGS[@]} -gt 0 ]]; then
-                join_args+=("${NETWORK_ARGS[@]}")
-            fi
-
-            log "Joining HA master to ${server}..."
-
-            curl -sfL https://get.k3s.io |
-                INSTALL_K3S_EXEC="${join_args[*]}" sh -
-
-            local node_ip
-            if [[ -n "$iface" ]]; then
-                node_ip="$(get_interface_ip "$iface")"
-            else
-                node_ip="$(get_best_ip)"
-            fi
-
-            write_role_config \
-                "master" \
-                "$iface" \
-                "$node_ip" \
-                "$server"
-
-            if $worker; then
-                untaint_self
-            fi
-
-            if [[ "$INIT" == "systemd" ]]; then
-                systemctl enable k3s
-            else
-                rc-update add k3s default 2>/dev/null || true
-            fi
-
-            log "HA master joined successfully."
-
+            install_join_master "$@"
             ;;
-
-        worker)
-
-            [[ -n "$server" ]] ||
-                err "worker requires --server."
-
-            [[ -n "$token" ]] ||
-                err "worker requires --token."
-
-            local -a worker_args
-            worker_args=("agent")
-
-            if [[ ${#NETWORK_ARGS[@]} -gt 0 ]]; then
-                worker_args+=("${NETWORK_ARGS[@]}")
-            fi
-
-            log "Installing K3s worker..."
-
-            curl -sfL https://get.k3s.io |
-                K3S_URL="$server" \
-                K3S_TOKEN="$token" \
-                INSTALL_K3S_EXEC="${worker_args[*]}" \
-                sh -
-
-            local worker_ip
-            if [[ -n "$iface" ]]; then
-                worker_ip="$(get_interface_ip "$iface")"
-            else
-                worker_ip="$(get_best_ip)"
-            fi
-
-            write_role_config \
-                "worker" \
-                "$iface" \
-                "$worker_ip" \
-                "$server"
-
-            if [[ "$INIT" == "systemd" ]]; then
-                systemctl enable k3s-agent
-            else
-                rc-update add k3s-agent default 2>/dev/null || true
-            fi
-
-            log "Worker joined successfully."
-
-            ;;
-
         *)
-            usage_install
-            err "Specify master, join-master, or worker."
-
+            die "Usage: k3s-manager install {master|worker|join-master} [options]"
             ;;
-
     esac
 }
-
-# ==============================================================================
-# MASTER WORKLOADS
-# ==============================================================================
-
-untaint_self() {
-    local node
-
-    node="$(hostname)"
-
-    sleep 5
-
-    KUBECONFIG="$KUBECONFIG_PATH" \
-        k3s kubectl taint nodes "$node" \
-        node-role.kubernetes.io/master- \
-        node-role.kubernetes.io/control-plane- \
-        --overwrite 2>/dev/null || true
-
-    log "Removed scheduling taints from ${node}."
-}
-
-# ==============================================================================
-# JOIN INFORMATION
-# ==============================================================================
 
 cmd_token() {
     need_root
 
-    [[ -f /var/lib/rancher/k3s/server/node-token ]] ||
-        err "No K3s server token found."
+    [[ -r "$K3S_TOKEN_FILE" ]] ||
+        die "K3s server token not found. This node is not a K3s server."
 
     local token
-    token="$(cat /var/lib/rancher/k3s/server/node-token)"
+    token="$(cat "$K3S_TOKEN_FILE")"
 
     echo
-    echo "=============================================="
-    echo "             K3S JOIN INFORMATION"
-    echo "=============================================="
+    echo "=================================================="
+    echo "                 K3S JOIN INFORMATION"
+    echo "=================================================="
     echo
 
-    local iface
-    local ipaddr
+    local iface ipaddr
+    local found=0
 
     for iface in en0 eth0 wlan0 wlan1; do
-
-        if interface_exists "$iface"; then
-
-            ipaddr="$(interface_ipv4 "$iface" || true)"
-
+        if iface_exists "$iface"; then
+            ipaddr="$(iface_ip "$iface" || true)"
             if [[ -n "$ipaddr" ]]; then
+                found=1
                 echo "$iface:"
                 echo "  Server URL: https://${ipaddr}:6443"
                 echo
             fi
-
         fi
-
     done
+
+    if [[ "$found" -eq 0 ]]; then
+        ipaddr="$(best_ip)"
+        if [[ -n "$ipaddr" ]]; then
+            echo "Detected:"
+            echo "  Server URL: https://${ipaddr}:6443"
+            echo
+        fi
+    fi
 
     echo "Token:"
     echo "  ${token}"
     echo
-
-    echo "----------------------------------------------"
-    echo "WORKER JOIN"
-    echo "----------------------------------------------"
+    echo "Worker:"
+    echo "  sudo k3s-manager install worker --server https://<MASTER-IP>:6443 --token '<TOKEN>' --interface eth0"
     echo
-    echo "sudo k3s-manager install worker \\"
-    echo "  --server https://<MASTER-IP>:6443 \\"
-    echo "  --token <TOKEN> \\"
-    echo "  --interface eth0"
-    echo
-
-    echo "----------------------------------------------"
-    echo "HA MASTER JOIN"
-    echo "----------------------------------------------"
-    echo
-    echo "sudo k3s-manager install join-master \\"
-    echo "  --server https://<MASTER-IP>:6443 \\"
-    echo "  --token <TOKEN> \\"
-    echo "  --interface eth0"
+    echo "Additional HA master:"
+    echo "  sudo k3s-manager install join-master --server https://<MASTER-IP>:6443 --token '<TOKEN>' --interface eth0"
     echo
 }
 
-# ==============================================================================
-# NETWORK INFO
-# ==============================================================================
+cmd_status() {
+    need_root
+    load_os
+    load_config
+
+    echo "=== K3S MANAGER ==="
+    echo "Version:    $VERSION"
+    echo "Role:       ${K3SMGR_ROLE:-unknown}"
+    echo "Interface:  ${K3SMGR_INTERFACE:-automatic}"
+    echo "Node IP:    ${K3SMGR_NODE_IP:-unknown}"
+    echo "Server:     ${K3SMGR_SERVER_URL:-unknown}"
+    echo
+
+    if [[ "${K3SMGR_ROLE:-}" == "worker" ]]; then
+        echo "=== K3S AGENT ==="
+        if [[ "$INIT" == "systemd" ]]; then
+            systemctl --no-pager --full status k3s-agent || true
+        else
+            rc-service k3s-agent status || true
+        fi
+    else
+        echo "=== K3S SERVER ==="
+        if [[ "$INIT" == "systemd" ]]; then
+            systemctl --no-pager --full status k3s || true
+        else
+            rc-service k3s status || true
+        fi
+
+        if [[ -f "$KUBECONFIG_PATH" ]]; then
+            echo
+            echo "=== CLUSTER NODES ==="
+            kctl get nodes -o wide || true
+        fi
+    fi
+}
+
+cmd_list_nodes() {
+    need_root
+    kctl get nodes -o wide
+}
 
 cmd_network_info() {
     network_info
 }
 
-# ==============================================================================
-# BOOT
-# ==============================================================================
-
 cmd_enable_boot() {
     need_root
-    detect_os
+    load_os
     load_config
 
     local service="k3s"
-
-    [[ "${K3SMGR_ROLE:-}" == "worker" ]] &&
-        service="k3s-agent"
+    [[ "${K3SMGR_ROLE:-}" == "worker" ]] && service="k3s-agent"
 
     if [[ "$INIT" == "systemd" ]]; then
         systemctl enable "$service"
-        log "${service} enabled at boot."
+        echo "$service enabled at boot."
     else
-        rc-update add "$service" default 2>/dev/null || true
-        log "${service} enabled at boot."
+        rc-update add "$service" default
+        echo "$service enabled at boot."
     fi
 }
 
 cmd_disable_boot() {
     need_root
-    detect_os
+    load_os
     load_config
 
     local service="k3s"
-
-    [[ "${K3SMGR_ROLE:-}" == "worker" ]] &&
-        service="k3s-agent"
+    [[ "${K3SMGR_ROLE:-}" == "worker" ]] && service="k3s-agent"
 
     if [[ "$INIT" == "systemd" ]]; then
         systemctl disable "$service"
-        log "${service} disabled at boot."
+        echo "$service disabled at boot."
     else
-        rc-update del "$service" default 2>/dev/null || true
-        log "${service} disabled at boot."
+        rc-update del "$service" default || true
+        echo "$service disabled at boot."
     fi
 }
 
-# ==============================================================================
-# STATUS
-# ==============================================================================
-
-cmd_status() {
-    detect_os
+cmd_restart() {
+    need_root
+    load_os
     load_config
 
-    echo
-    echo "=============================================="
-    echo "               K3S STATUS"
-    echo "=============================================="
-    echo
+    local service="k3s"
+    [[ "${K3SMGR_ROLE:-}" == "worker" ]] && service="k3s-agent"
 
-    echo "Role:       ${K3SMGR_ROLE:-unknown}"
-    echo "Interface:  ${K3SMGR_INTERFACE:-automatic}"
-    echo "Node IP:    ${K3SMGR_NODE_IP:-unknown}"
-    echo
-
-    if [[ -f "$KUBECONFIG_PATH" ]]; then
-
-        echo "=== CLUSTER NODES ==="
-        kctl get nodes -o wide || true
-
-        echo
-        echo "=== K3S SERVICE ==="
-
-        if [[ "$INIT" == "systemd" ]]; then
-            systemctl status k3s --no-pager || true
-        else
-            rc-service k3s status || true
-        fi
-
+    if [[ "$INIT" == "systemd" ]]; then
+        systemctl restart "$service"
     else
-
-        echo "=== WORKER SERVICE ==="
-
-        if [[ "$INIT" == "systemd" ]]; then
-            systemctl status k3s-agent --no-pager || true
-        else
-            rc-service k3s-agent status || true
-        fi
-
+        rc-service "$service" restart
     fi
 }
 
-# ==============================================================================
-# LIST NODES
-# ==============================================================================
+cmd_stop() {
+    need_root
+    load_os
+    load_config
 
-cmd_list_nodes() {
-    kctl get nodes -o wide
+    local service="k3s"
+    [[ "${K3SMGR_ROLE:-}" == "worker" ]] && service="k3s-agent"
+
+    if [[ "$INIT" == "systemd" ]]; then
+        systemctl stop "$service"
+    else
+        rc-service "$service" stop
+    fi
 }
 
-# ==============================================================================
-# ADD NODE
-# ==============================================================================
+cmd_start() {
+    need_root
+    load_os
+    load_config
+
+    local service="k3s"
+    [[ "${K3SMGR_ROLE:-}" == "worker" ]] && service="k3s-agent"
+
+    if [[ "$INIT" == "systemd" ]]; then
+        systemctl start "$service"
+    else
+        rc-service "$service" start
+    fi
+}
 
 cmd_add_node() {
     need_root
@@ -848,130 +697,60 @@ cmd_add_node() {
     local iface="eth0"
 
     while [[ $# -gt 0 ]]; do
-
         case "$1" in
-
             --ssh)
-                [[ $# -ge 2 ]] ||
-                    err "--ssh requires a target."
-
+                [[ $# -ge 2 ]] || die "--ssh requires user@host."
                 ssh_target="$2"
                 shift 2
                 ;;
-
             --interface)
-                [[ $# -ge 2 ]] ||
-                    err "--interface requires an interface."
-
+                [[ $# -ge 2 ]] || die "--interface requires an interface."
                 iface="$2"
                 shift 2
                 ;;
-
             *)
-                err "Unknown option: $1"
+                die "Unknown add-node option: $1"
                 ;;
-
         esac
-
     done
 
-    [[ -f /var/lib/rancher/k3s/server/node-token ]] ||
-        err "This command must be run on a master."
+    [[ -r "$K3S_TOKEN_FILE" ]] ||
+        die "This command must be run on a K3s server."
 
     local master_ip
-
-    master_ip="$(get_best_ip)"
+    master_ip="$(best_ip)"
+    [[ -n "$master_ip" ]] || die "Could not determine master IP."
 
     local token
-
-    token="$(cat /var/lib/rancher/k3s/server/node-token)"
+    token="$(cat "$K3S_TOKEN_FILE")"
 
     local server="https://${master_ip}:6443"
+    local remote_cmd
 
     case "$kind" in
-
         worker)
-
-            local cmd
-
-            cmd="sudo k3s-manager install worker --server ${server} --token '${token}' --interface ${iface}"
-
+            remote_cmd="sudo k3s-manager install worker --server $(printf '%q' "$server") --token $(printf '%q' "$token") --interface $(printf '%q' "$iface")"
             ;;
-
         master)
-
-            cmd="sudo k3s-manager install join-master --server ${server} --token '${token}' --interface ${iface}"
-
+            remote_cmd="sudo k3s-manager install join-master --server $(printf '%q' "$server") --token $(printf '%q' "$token") --interface $(printf '%q' "$iface")"
             ;;
-
         *)
-
-            err "Specify worker or master."
-
+            die "Usage: k3s-manager add-node {worker|master} [--ssh user@host] [--interface eth0]"
             ;;
-
     esac
 
     if [[ -n "$ssh_target" ]]; then
-
-        log "Running remote installation on ${ssh_target}..."
-
-        ssh \
-            -o StrictHostKeyChecking=accept-new \
-            "$ssh_target" \
-            "$cmd"
-
+        ssh -o StrictHostKeyChecking=accept-new "$ssh_target" "$remote_cmd"
     else
-
-        echo
-        echo "$cmd"
-        echo
-
+        echo "$remote_cmd"
     fi
 }
-
-# ==============================================================================
-# REMOVE NODE
-# ==============================================================================
 
 cmd_remove_node() {
     need_root
 
     local node="${1:-}"
-    local purge=false
-    local ssh_target=""
-
-    shift || true
-
-    while [[ $# -gt 0 ]]; do
-
-        case "$1" in
-
-            --purge)
-                purge=true
-                shift
-                ;;
-
-            --ssh)
-                [[ $# -ge 2 ]] ||
-                    err "--ssh requires a target."
-
-                ssh_target="$2"
-                shift 2
-                ;;
-
-            *)
-                err "Unknown option: $1"
-                ;;
-
-        esac
-
-    done
-
-    [[ -n "$node" ]] ||
-        err "Usage: remove-node NODE [--purge] [--ssh user@host]"
-
-    log "Draining ${node}..."
+    [[ -n "$node" ]] || die "Usage: k3s-manager remove-node NODE"
 
     kctl drain "$node" \
         --ignore-daemonsets \
@@ -981,190 +760,136 @@ cmd_remove_node() {
 
     kctl delete node "$node" || true
 
-    log "${node} removed from cluster."
-
-    if $purge && [[ -n "$ssh_target" ]]; then
-
-        ssh \
-            -o StrictHostKeyChecking=accept-new \
-            "$ssh_target" \
-            "sudo /usr/local/bin/k3s-uninstall.sh 2>/dev/null || sudo /usr/local/bin/k3s-agent-uninstall.sh 2>/dev/null || true"
-
-    fi
+    echo "Node removed: $node"
 }
 
-# ==============================================================================
-# WATCHDOG
-# ==============================================================================
+cmd_uninstall() {
+    need_root
+
+    if [[ -x /usr/local/bin/k3s-uninstall.sh ]]; then
+        /usr/local/bin/k3s-uninstall.sh
+    elif [[ -x /usr/local/bin/k3s-agent-uninstall.sh ]]; then
+        /usr/local/bin/k3s-agent-uninstall.sh
+    else
+        die "No K3s uninstall script found."
+    fi
+
+    rm -rf "$CONFIG_DIR"
+    echo "K3s manager configuration removed."
+}
 
 cmd_watchdog_install() {
     need_root
+    load_os
 
     local master=""
-    local key=""
     local interval=15
     local threshold=8
 
     while [[ $# -gt 0 ]]; do
-
         case "$1" in
-
             --master)
+                [[ $# -ge 2 ]] || die "--master requires an IP/hostname."
                 master="$2"
                 shift 2
                 ;;
-
-            --standby-ssh-key)
-                key="$2"
-                shift 2
-                ;;
-
             --check-interval)
+                [[ $# -ge 2 ]] || die "--check-interval requires seconds."
                 interval="$2"
                 shift 2
                 ;;
-
             --fail-threshold)
+                [[ $# -ge 2 ]] || die "--fail-threshold requires a number."
                 threshold="$2"
                 shift 2
                 ;;
-
             *)
-                err "Unknown option: $1"
+                die "Unknown watchdog option: $1"
                 ;;
-
         esac
-
     done
 
-    [[ -n "$master" ]] ||
-        err "--master is required."
+    [[ -n "$master" ]] || die "--master is required."
 
-    [[ -n "$key" ]] ||
-        err "--standby-ssh-key is required."
+    install -d -m 0755 "$CONFIG_DIR"
 
-    mkdir -p "$SNAPSHOT_DIR" "$CONFIG_DIR"
-
-    cat > "$CONFIG_FILE" <<EOF
-K3SMGR_ROLE=worker
-K3SMGR_MASTER_IP=${master}
-K3SMGR_SSH_KEY=${key}
-K3SMGR_FAIL_THRESHOLD=${threshold}
-EOF
+    cat > "$CONFIG_FILE" <<CFG
+K3SMGR_WATCHDOG_MASTER=$(printf '%q' "$master")
+K3SMGR_WATCHDOG_INTERVAL=$(printf '%q' "$interval")
+K3SMGR_WATCHDOG_THRESHOLD=$(printf '%q' "$threshold")
+CFG
 
     chmod 600 "$CONFIG_FILE"
 
-    cat > "$WATCHDOG_SCRIPT" <<'EOF'
+    cat > /usr/local/bin/k3s-manager-watchdog.sh <<'WATCHDOG'
 #!/usr/bin/env bash
+set -Eeuo pipefail
 
-set -euo pipefail
+CONFIG="/etc/k3s-manager/config.env"
+STATE_DIR="/var/lib/k3s-manager"
+STATE_FILE="${STATE_DIR}/watchdog-failures"
 
-CONFIG_FILE="/etc/k3s-manager/config.env"
-STATE_FILE="/var/lib/k3s-manager/fail_count"
-SNAPSHOT_DIR="/var/lib/k3s-manager/snapshots"
+[[ -r "$CONFIG" ]] || exit 0
+# shellcheck disable=SC1090
+. "$CONFIG"
 
-[[ -f "$CONFIG_FILE" ]] || exit 0
+mkdir -p "$STATE_DIR"
 
-. "$CONFIG_FILE"
+MASTER="${K3SMGR_WATCHDOG_MASTER:-}"
+THRESHOLD="${K3SMGR_WATCHDOG_THRESHOLD:-8}"
 
-mkdir -p "$SNAPSHOT_DIR" "$(dirname "$STATE_FILE")"
+[[ -n "$MASTER" ]] || exit 0
 
-fail_count=0
+failures=0
+[[ -r "$STATE_FILE" ]] && failures="$(cat "$STATE_FILE")"
 
-[[ -f "$STATE_FILE" ]] &&
-    fail_count="$(cat "$STATE_FILE")"
-
-if curl -sk --max-time 5 \
-    "https://${K3SMGR_MASTER_IP}:6443/healthz" |
-    grep -q ok
-then
-
+if curl -kfsS --connect-timeout 3 --max-time 5 "https://${MASTER}:6443/healthz" >/dev/null 2>&1; then
     echo 0 > "$STATE_FILE"
-
-    rsync -az \
-        -e "ssh -i ${K3SMGR_SSH_KEY} -o StrictHostKeyChecking=accept-new" \
-        "root@${K3SMGR_MASTER_IP}:/var/lib/rancher/k3s/server/db/snapshots/" \
-        "$SNAPSHOT_DIR/" 2>/dev/null || true
-
     exit 0
 fi
 
-fail_count=$((fail_count + 1))
+failures=$((failures + 1))
+echo "$failures" > "$STATE_FILE"
 
-echo "$fail_count" > "$STATE_FILE"
+logger -t k3s-manager-watchdog "K3s master ${MASTER} unreachable (${failures}/${THRESHOLD})"
 
-logger -t k3s-manager-watchdog \
-    "Master ${K3SMGR_MASTER_IP} unreachable (${fail_count}/${K3SMGR_FAIL_THRESHOLD})"
-
-if [[ "$fail_count" -ge "${K3SMGR_FAIL_THRESHOLD}" ]]; then
-
-    logger -t k3s-manager-watchdog \
-        "Promoting this node to master."
-
-    latest="$(ls -t "$SNAPSHOT_DIR" 2>/dev/null | head -n1 || true)"
-
-    systemctl stop k3s-agent 2>/dev/null || true
-
-    if [[ -n "$latest" ]]; then
-
-        curl -sfL https://get.k3s.io |
-            INSTALL_K3S_EXEC="server --cluster-reset --cluster-reset-restore-path=${SNAPSHOT_DIR}/${latest}" \
-            sh -
-
-    else
-
-        curl -sfL https://get.k3s.io |
-            INSTALL_K3S_EXEC="server --cluster-init" \
-            sh -
-
-    fi
-
-    mkdir -p "$(dirname "$CONFIG_FILE")"
-
-    cat > "$CONFIG_FILE" <<EOF
-K3SMGR_ROLE=master
-K3SMGR_NODE_IP=$(hostname -I | awk '{print $1}')
-EOF
-
-    systemctl disable --now k3s-manager-watchdog.timer 2>/dev/null || true
-
-    logger -t k3s-manager-watchdog \
-        "Promotion completed."
-
+if (( failures >= THRESHOLD )); then
+    logger -t k3s-manager-watchdog "Failover threshold reached; watchdog will not automatically rewrite the cluster."
+    logger -t k3s-manager-watchdog "Manual promotion is required: sudo k3s-manager promote"
 fi
-EOF
+WATCHDOG
 
-    chmod +x "$WATCHDOG_SCRIPT"
+    chmod 0755 /usr/local/bin/k3s-manager-watchdog.sh
 
-    cat > "$WATCHDOG_SERVICE" <<EOF
+    cat > /etc/systemd/system/k3s-manager-watchdog.service <<'SERVICE'
 [Unit]
 Description=K3s Manager Watchdog
 
 [Service]
 Type=oneshot
-ExecStart=${WATCHDOG_SCRIPT}
-EOF
+ExecStart=/usr/local/bin/k3s-manager-watchdog.sh
+SERVICE
 
-    cat > "$WATCHDOG_TIMER" <<EOF
+    cat > /etc/systemd/system/k3s-manager-watchdog.timer <<SERVICE
 [Unit]
 Description=K3s Manager Watchdog Timer
 
 [Timer]
-OnBootSec=30
+OnBootSec=30s
 OnUnitActiveSec=${interval}s
 AccuracySec=1s
 
 [Install]
 WantedBy=timers.target
-EOF
+SERVICE
 
     systemctl daemon-reload
-
     systemctl enable --now k3s-manager-watchdog.timer
 
-    log "Watchdog installed."
-    log "Check interval: ${interval}s"
-    log "Fail threshold: ${threshold}"
+    echo "Watchdog installed."
+    echo "Master: ${master}"
+    echo "Interval: ${interval}s"
+    echo "Failure threshold: ${threshold}"
 }
 
 cmd_watchdog_uninstall() {
@@ -1173,376 +898,231 @@ cmd_watchdog_uninstall() {
     systemctl disable --now k3s-manager-watchdog.timer 2>/dev/null || true
 
     rm -f \
-        "$WATCHDOG_TIMER" \
-        "$WATCHDOG_SERVICE" \
-        "$WATCHDOG_SCRIPT"
+        /etc/systemd/system/k3s-manager-watchdog.timer \
+        /etc/systemd/system/k3s-manager-watchdog.service \
+        /usr/local/bin/k3s-manager-watchdog.sh
 
     systemctl daemon-reload
+    rm -rf /var/lib/k3s-manager
 
-    log "Watchdog removed."
+    echo "Watchdog removed."
 }
 
 cmd_promote() {
     need_root
 
-    [[ -x "$WATCHDOG_SCRIPT" ]] ||
-        err "Watchdog is not installed."
-
-    "$WATCHDOG_SCRIPT"
-}
-
-# ==============================================================================
-# RANCHER
-# ==============================================================================
-
-cmd_install_rancher() {
-    need_root
-
-    [[ -f "$KUBECONFIG_PATH" ]] ||
-        err "This must be run on a master."
-
-    export KUBECONFIG="$KUBECONFIG_PATH"
-
-    local hostname_arg=""
-    local bootstrap_pass=""
-
-    while [[ $# -gt 0 ]]; do
-
-        case "$1" in
-
-            --hostname)
-                hostname_arg="$2"
-                shift 2
-                ;;
-
-            --password)
-                bootstrap_pass="$2"
-                shift 2
-                ;;
-
-            *)
-                err "Unknown option: $1"
-                ;;
-
-        esac
-
-    done
-
-    if ! have helm; then
-
-        curl -fsSL \
-            https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 |
-            bash
-
-    fi
-
-    helm repo add jetstack \
-        https://charts.jetstack.io \
-        --force-update
-
-    helm repo add rancher-stable \
-        https://releases.rancher.com/server-charts/stable \
-        --force-update
-
-    helm repo update
-
-    k3s kubectl create namespace cert-manager \
-        --dry-run=client \
-        -o yaml |
-        k3s kubectl apply -f -
-
-    helm upgrade -i cert-manager \
-        jetstack/cert-manager \
-        -n cert-manager \
-        --set installCRDs=true \
-        --wait
-
-    k3s kubectl create namespace cattle-system \
-        --dry-run=client \
-        -o yaml |
-        k3s kubectl apply -f -
-
-    local node_ip
-    node_ip="$(get_best_ip)"
-
-    local rancher_host
-    rancher_host="${hostname_arg:-${node_ip}.sslip.io}"
-
-    [[ -n "$bootstrap_pass" ]] ||
-        bootstrap_pass="$(
-            head -c32 /dev/urandom |
-                base64 |
-                tr -dc 'a-zA-Z0-9' |
-                head -c20
-        )"
-
-    helm upgrade -i rancher \
-        rancher-stable/rancher \
-        -n cattle-system \
-        --set hostname="$rancher_host" \
-        --set bootstrapPassword="$bootstrap_pass" \
-        --set replicas=1 \
-        --wait
-
-    k3s kubectl \
-        -n cattle-system \
-        patch svc rancher \
-        -p '{"spec":{"type":"NodePort"}}' \
-        || true
-
-    local nodeport
-
-    nodeport="$(
-        k3s kubectl \
-            -n cattle-system \
-            get svc rancher \
-            -o jsonpath='{.spec.ports[0].nodePort}' \
-            2>/dev/null ||
-            echo "?"
-    )"
-
-    echo
-    echo "Rancher GUI:"
-    echo "https://${rancher_host}"
-    echo
-    echo "Direct NodePort:"
-    echo "https://${node_ip}:${nodeport}"
-    echo
-    echo "Bootstrap password:"
-    echo "${bootstrap_pass}"
-    echo
-}
-
-cmd_uninstall_rancher() {
-    need_root
-
-    export KUBECONFIG="$KUBECONFIG_PATH"
-
-    helm uninstall rancher \
-        -n cattle-system \
-        2>/dev/null ||
-        true
-
-    helm uninstall cert-manager \
-        -n cert-manager \
-        2>/dev/null ||
-        true
-
-    log "Rancher removed."
-}
-
-# ==============================================================================
-# UNINSTALL
-# ==============================================================================
-
-cmd_uninstall() {
-    need_root
-
-    if [[ -x /usr/local/bin/k3s-uninstall.sh ]]; then
-
-        /usr/local/bin/k3s-uninstall.sh
-
-    elif [[ -x /usr/local/bin/k3s-agent-uninstall.sh ]]; then
-
-        /usr/local/bin/k3s-agent-uninstall.sh
-
+    if [[ -x /usr/local/bin/k3s-manager-watchdog.sh ]]; then
+        /usr/local/bin/k3s-manager-watchdog.sh
     else
-
-        err "No K3s uninstall script found."
-
+        echo "Watchdog is not installed."
+        echo "Automatic promotion is intentionally not performed by this command."
     fi
-
-    rm -rf "$CONFIG_DIR"
-
-    log "K3s removed."
 }
 
-# ==============================================================================
-# HELP
-# ==============================================================================
+cmd_help() {
+    cat <<'HELP'
+K3S MANAGER
+===========
 
-usage() {
-    cat <<'EOF'
+Install a master:
 
-===========================================================
-                    K3S MANAGER
-===========================================================
+  sudo k3s-manager install master --interface eth0
 
-INSTALLATION
-
-First master:
+Install an HA/embedded-etcd first master:
 
   sudo k3s-manager install master --ha --interface eth0
 
-Master + workloads:
+Allow workloads on the master:
 
   sudo k3s-manager install master --ha --worker --interface eth0
 
-
-WORKER
-
-  sudo k3s-manager install worker \
-      --server https://MASTER_IP:6443 \
-      --token TOKEN \
-      --interface eth0
-
-
-ADDITIONAL HA MASTER
-
-  sudo k3s-manager install join-master \
-      --server https://MASTER_IP:6443 \
-      --token TOKEN \
-      --interface eth0
-
-
-INFORMATION
+Get join information:
 
   sudo k3s-manager token
 
+Install a worker:
+
+  sudo k3s-manager install worker \
+    --server https://MASTER_IP:6443 \
+    --token 'TOKEN' \
+    --interface eth0
+
+Join another HA master:
+
+  sudo k3s-manager install join-master \
+    --server https://MASTER_IP:6443 \
+    --token 'TOKEN' \
+    --interface eth0
+
+Network information:
+
   sudo k3s-manager network-info
+
+Cluster status:
 
   sudo k3s-manager status
 
+List nodes:
+
   sudo k3s-manager list-nodes
 
+Start/stop/restart:
 
-NODE MANAGEMENT
+  sudo k3s-manager start
+  sudo k3s-manager stop
+  sudo k3s-manager restart
 
-  sudo k3s-manager add-node worker
-
-  sudo k3s-manager add-node master
-
-  sudo k3s-manager remove-node NODE
-
-
-BOOT
+Boot:
 
   sudo k3s-manager enable-boot
-
   sudo k3s-manager disable-boot
 
+Add a node:
 
-FAILOVER
+  sudo k3s-manager add-node worker
+  sudo k3s-manager add-node master
 
-  sudo k3s-manager watchdog-install \
-      --master MASTER_IP \
-      --standby-ssh-key /root/.ssh/id_rsa
+Add over SSH:
+
+  sudo k3s-manager add-node worker --ssh barnaby@worker1 --interface eth0
+
+Remove a node:
+
+  sudo k3s-manager remove-node NODE_NAME
+
+Watchdog:
+
+  sudo k3s-manager watchdog-install --master MASTER_IP
 
   sudo k3s-manager watchdog-uninstall
 
   sudo k3s-manager promote
 
-
-RANCHER
-
-  sudo k3s-manager install-rancher
-
-  sudo k3s-manager uninstall-rancher
-
-
-UNINSTALL
+Uninstall:
 
   sudo k3s-manager uninstall
 
-
 NETWORKING
+==========
 
-Use --interface eth0 to force K3s to use eth0.
+--interface eth0 causes K3s to use the IPv4 address assigned to eth0
+for:
 
-For example:
+  --node-ip
+  --advertise-address
+  --flannel-iface
 
-  sudo k3s-manager install master \
-      --ha \
-      --worker \
-      --interface eth0
+The token command displays all detected addresses for:
 
+  en0
+  eth0
+  wlan0
+  wlan1
 
-===========================================================
+IMPORTANT:
 
-EOF
+For a multi-node cluster, every node must be able to reach the selected
+master address on TCP 6443 and the K3s networking traffic must be allowed
+between nodes.
+
+EXAMPLES
+========
+
+One master + one worker:
+
+  MASTER:
+    sudo k3s-manager install master --interface eth0
+
+  MASTER:
+    sudo k3s-manager token
+
+  WORKER:
+    sudo k3s-manager install worker --server https://MASTER_ETH0_IP:6443 --token 'TOKEN' --interface eth0
+
+One master + multiple workers:
+
+  Run the worker installation on every worker using the same server/token.
+
+HA:
+
+  MASTER 1:
+    sudo k3s-manager install master --ha --interface eth0
+
+  MASTER 2/3:
+    sudo k3s-manager install join-master --server https://MASTER1_ETH0_IP:6443 --token 'TOKEN' --interface eth0
+
+VERSION
+=======
+
+  k3s-manager ${VERSION}
+HELP
 }
 
-# ==============================================================================
-# MAIN
-# ==============================================================================
-
 main() {
-
-    local cmd="${1:-}"
-
+    local command="${1:-help}"
     shift || true
 
-    case "$cmd" in
-
+    case "$command" in
         install)
             cmd_install "$@"
             ;;
-
-        token)
+        token|join-info)
             cmd_token
             ;;
-
         network-info)
             cmd_network_info
             ;;
-
         status)
             cmd_status
             ;;
-
-        list-nodes)
+        list-nodes|get-nodes)
             cmd_list_nodes
             ;;
-
+        start)
+            cmd_start
+            ;;
+        stop)
+            cmd_stop
+            ;;
+        restart)
+            cmd_restart
+            ;;
         enable-boot)
             cmd_enable_boot
             ;;
-
         disable-boot)
             cmd_disable_boot
             ;;
-
         add-node)
             cmd_add_node "$@"
             ;;
-
         remove-node)
             cmd_remove_node "$@"
             ;;
-
         watchdog-install)
             cmd_watchdog_install "$@"
             ;;
-
         watchdog-uninstall)
             cmd_watchdog_uninstall
             ;;
-
         promote)
             cmd_promote
             ;;
-
-        install-rancher)
-            cmd_install_rancher "$@"
-            ;;
-
-        uninstall-rancher)
-            cmd_uninstall_rancher
-            ;;
-
         uninstall)
             cmd_uninstall
             ;;
-
-        help|--help|-h|"")
-            usage
+        version|--version|-V)
+            echo "k3s-manager ${VERSION}"
             ;;
-
+        help|--help|-h)
+            cmd_help
+            ;;
         *)
-            usage
-            err "Unknown command: ${cmd}"
+            echo "Unknown command: $command" >&2
+            echo
+            cmd_help
+            exit 1
             ;;
-
     esac
 }
 
