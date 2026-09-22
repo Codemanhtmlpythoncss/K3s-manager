@@ -1,5 +1,5 @@
-installation: ``curl -sfL https://raw.githubusercontent.com/Codemanhtmlpythoncss/K3s-manager/main/k3s-manager.sh -o /usr/local/bin/k3s-manager.sh \
-  && chmod +x /usr/local/bin/k3s-manager.sh``
+installation: ``sudo curl -sfL https://raw.githubusercontent.com/Codemanhtmlpythoncss/K3s-manager/main/k3s-manager.sh -o /usr/local/bin/k3s-manager
+sudo chmod +x /usr/local/bin/k3s-manager``
 
 usage: 
 
