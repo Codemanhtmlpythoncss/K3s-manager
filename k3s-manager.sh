@@ -12,7 +12,7 @@ if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 3) ))
     exit 1
 fi
 
-VERSION="3.1.0"
+VERSION="3.1.2"
 REPO_RAW_URL="${K3SMGR_REPO_RAW_URL:-https://raw.githubusercontent.com/Codemanhtmlpythoncss/K3s-manager/main/k3s-manager.sh}"
 SELF_PATH="$(command -v -- "$0" 2>/dev/null || readlink -f -- "$0" 2>/dev/null || echo "$0")"
 CONFIG_DIR="/etc/k3s-manager"
@@ -365,19 +365,21 @@ validate_interface() {
     printf '%s\n' "$ipaddr"
 }
 
+# build_network_args IFACE [MODE]
+# MODE is "server" (default) or "agent". `k3s agent` has no --advertise-address
+# flag at all (it's a server/apiserver-only concept) -- passing it makes the
+# agent refuse to start with "flag provided but not defined: -advertise-address".
 build_network_args() {
     local iface="${1:-}"
+    local mode="${2:-server}"
     NETWORK_ARGS=()
 
     if [[ -n "$iface" ]]; then
         local ipaddr
         ipaddr="$(validate_interface "$iface")"
 
-        NETWORK_ARGS=(
-            "--node-ip" "$ipaddr"
-            "--advertise-address" "$ipaddr"
-            "--flannel-iface" "$iface"
-        )
+        NETWORK_ARGS=("--node-ip" "$ipaddr" "--flannel-iface" "$iface")
+        [[ "$mode" == "server" ]] && NETWORK_ARGS+=("--advertise-address" "$ipaddr")
     fi
 }
 
@@ -696,12 +698,6 @@ preflight_host_ports() {
     fi
 }
 
-# fix_forward_policy -- Docker (used by Nextcloud AIO and many homelab setups) and
-# k3s/flannel both depend on the FORWARD chain allowing traffic. A DROP/REJECT
-# default policy is a common, well-documented cause of "it worked until I
-# installed the other one" breakage. Only touches the policy if it is actually
-# blocking, and only when explicitly asked to fix (doctor --fix), since this is
-# a host-wide firewall posture change.
 forward_policy_is_blocking() {
     have iptables || return 1
     local policy
@@ -709,6 +705,12 @@ forward_policy_is_blocking() {
     [[ "$policy" == "DROP" || "$policy" == "REJECT" ]]
 }
 
+# fix_forward_policy -- Docker (used by Nextcloud AIO and many homelab setups) and
+# k3s/flannel both depend on the FORWARD chain allowing traffic. A DROP/REJECT
+# default policy is a common, well-documented cause of "it worked until I
+# installed the other one" breakage. Only touches the policy if it is actually
+# blocking, and only when explicitly asked to fix (doctor --fix), since this is
+# a host-wide firewall posture change.
 fix_forward_policy() {
     have iptables || return 0
     local policy
@@ -996,7 +998,7 @@ install_worker() {
 
     preflight_join "$server"
     install_prereqs
-    build_network_args "$iface"
+    build_network_args "$iface" "agent"
 
     local -a args=("agent")
     [[ "${#NETWORK_ARGS[@]}" -gt 0 ]] && args+=("${NETWORK_ARGS[@]}")
@@ -1107,36 +1109,49 @@ cmd_token() {
     local token
     token="$(cat "$K3S_TOKEN_FILE")"
 
+    local default_ip
+    default_ip="$(best_ip)"
+
     echo
     echo "=================================================="
     echo "                 K3S JOIN INFORMATION"
     echo "=================================================="
     echo
-    echo "Detected addresses on this node:"
+    echo "Token:"
+    echo "  ${token}"
     echo
-    local name cidr ipaddr
+    echo "Ready-to-run join commands (one per detected address on this node)."
+    echo "If --interface doesn't match the OTHER machine's own NIC name, change"
+    echo "it -- check with 'ip -br addr' or 'k3s-manager network-info' there."
+    echo
+
+    local name cidr ipaddr note
     while read -r name cidr; do
         [[ -z "$name" ]] && continue
         ipaddr="${cidr%%/*}"
-        echo "  ${name}: https://${ipaddr}:6443"
+        note=""
+        [[ "$ipaddr" == "$default_ip" ]] && note="  (this node's default-routed address -- likely Wi-Fi/LAN, not a dedicated cluster NIC)"
+        echo "-- via ${name} (${ipaddr})${note} --"
+        echo "  Worker:"
+        echo "    sudo k3s-manager install worker --server https://${ipaddr}:6443 --token '${token}' --interface eth0"
+        echo "  Additional HA master:"
+        echo "    sudo k3s-manager install join-master --server https://${ipaddr}:6443 --token '${token}' --interface eth0"
+        echo
     done < <(list_candidate_ifaces)
 
     if have tailscale; then
         local tsip
         tsip="$(tailscale_ip || true)"
-        [[ -n "$tsip" ]] && echo "  tailscale: https://${tsip}:6443"
+        if [[ -n "$tsip" ]]; then
+            echo "-- via tailscale (${tsip}) --"
+            echo "  Worker (Tailscale isn't a local NIC to pin --interface to, so it's omitted):"
+            echo "    sudo k3s-manager install worker --server https://${tsip}:6443 --token '${token}'"
+            echo
+        fi
     fi
 
-    echo
-    echo "Token:"
-    echo "  ${token}"
-    echo
-    echo "Worker:"
-    echo "  sudo k3s-manager install worker --server https://<MASTER-IP>:6443 --token '<TOKEN>' --interface eth0"
-    echo
-    echo "Additional HA master:"
-    echo "  sudo k3s-manager install join-master --server https://<MASTER-IP>:6443 --token '<TOKEN>' --interface eth0"
-    echo
+    echo "Remote provisioning over SSH instead (run from here):"
+    echo "  sudo k3s-manager add-node worker --ssh user@<target-ip> --interface eth0"
 }
 
 cmd_status() {
@@ -1817,6 +1832,13 @@ find_git_root_of_self() {
     fi
 }
 
+need_root_if_owned_by_root() {
+    local path="$1"
+    if [[ "$(stat -c '%U' "$path" 2>/dev/null || stat -f '%Su' "$path" 2>/dev/null)" == "root" ]]; then
+        need_root
+    fi
+}
+
 cmd_update() {
     local check_only=0 ref="main" force=0
 
@@ -1919,180 +1941,6 @@ cmd_update() {
         rm -f "$tmp"
         die "Failed to install the update. Your original script is unchanged (backup at ${backup})."
     fi
-}
-
-need_root_if_owned_by_root() {
-    local path="$1"
-    if [[ "$(stat -c '%U' "$path" 2>/dev/null || stat -f '%Su' "$path" 2>/dev/null)" == "root" ]]; then
-        need_root
-    fi
-}
-
-# ---------- interactive menu ----------
-
-pick_interface() {
-    local prompt="${1:-Select the interface k3s should bind to}"
-    echo "$prompt:" >&2
-    local -a names=()
-    local i=1 name cidr
-    while read -r name cidr; do
-        [[ -z "$name" ]] && continue
-        names+=("$name")
-        printf '  %d) %-10s %s\n' "$i" "$name" "$cidr" >&2
-        i=$((i + 1))
-    done < <(list_candidate_ifaces)
-    printf '  %d) %s\n' "$i" "skip (let k3s auto-select)" >&2
-
-    local choice
-    choice="$(ask "Choice" "1")"
-    if [[ "$choice" == "$i" ]]; then
-        echo ""
-        return 0
-    fi
-    if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice < i )); then
-        echo "${names[$((choice - 1))]}"
-        return 0
-    fi
-    # allow typing an interface name directly
-    echo "$choice"
-}
-
-random_token() {
-    if have openssl; then
-        openssl rand -hex 32
-    else
-        head -c48 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | head -c64
-    fi
-}
-
-menu_install_master() {
-    local ha=""
-    confirm "Enable HA (embedded etcd, allows multiple masters)?" n && ha="--ha"
-    local allow=""
-    confirm "Allow workloads to run on this master (useful for a single-node/small cluster)?" y && allow="--worker"
-
-    local iface
-    iface="$(pick_interface "Select the network interface for cluster traffic (e.g. your dedicated Ethernet NIC)")"
-
-    local channel
-    echo "Release channel: 1) stable  2) latest  3) testing  4) pin exact version"
-    local cchoice
-    cchoice="$(ask "Choice" "1")"
-    local version=""
-    case "$cchoice" in
-        1) channel="stable" ;;
-        2) channel="latest" ;;
-        3) channel="testing" ;;
-        4) channel=""; version="$(ask "Exact version (e.g. v1.31.4+k3s1)")" ;;
-        *) channel="stable" ;;
-    esac
-
-    local no_auto_san=""
-    if have tailscale && ! confirm "Include this node's Tailscale IP/hostname in the TLS certificate (recommended for remote kubectl access)?" y; then
-        no_auto_san="--no-auto-tls-san"
-    fi
-
-    local -a cmd_args=(install master)
-    [[ -n "$ha" ]] && cmd_args+=("$ha")
-    [[ -n "$allow" ]] && cmd_args+=("$allow")
-    [[ -n "$iface" ]] && cmd_args+=(--interface "$iface")
-    [[ -n "$channel" ]] && cmd_args+=(--channel "$channel")
-    [[ -n "$version" ]] && cmd_args+=(--version "$version")
-    [[ -n "$no_auto_san" ]] && cmd_args+=("$no_auto_san")
-    cmd_args+=(--yes)
-
-    echo
-    echo "About to run: $(basename "$SELF_PATH") ${cmd_args[*]}"
-    confirm "Proceed?" y || { echo "Cancelled."; return 0; }
-    cmd_install "master" "${cmd_args[@]:2}"
-}
-
-menu_install_worker() {
-    local server token
-    server="$(ask "Master API URL (e.g. https://10.50.0.1:6443)")"
-    [[ -n "$server" ]] || { echo "Server URL is required."; return 1; }
-    token="$(ask "Join token (from 'k3s-manager token' on the master)")"
-    [[ -n "$token" ]] || { echo "Token is required."; return 1; }
-
-    local iface
-    iface="$(pick_interface "Select the network interface for cluster traffic")"
-
-    local -a cmd_args=(--server "$server" --token "$token")
-    [[ -n "$iface" ]] && cmd_args+=(--interface "$iface")
-
-    echo
-    echo "About to join this node as a worker to ${server}"
-    confirm "Proceed?" y || { echo "Cancelled."; return 0; }
-    cmd_install "worker" "${cmd_args[@]}"
-}
-
-menu_install_join_master() {
-    local server token
-    server="$(ask "Existing master API URL (e.g. https://10.50.0.1:6443)")"
-    [[ -n "$server" ]] || { echo "Server URL is required."; return 1; }
-    token="$(ask "Join token")"
-    [[ -n "$token" ]] || { echo "Token is required."; return 1; }
-    local iface
-    iface="$(pick_interface "Select the network interface for cluster traffic")"
-
-    local -a cmd_args=(--server "$server" --token "$token")
-    [[ -n "$iface" ]] && cmd_args+=(--interface "$iface")
-
-    confirm "Proceed joining as an additional HA master?" y || { echo "Cancelled."; return 0; }
-    cmd_install "join-master" "${cmd_args[@]}"
-}
-
-cmd_menu() {
-    need_root
-    load_os
-    load_config
-
-    while true; do
-        echo
-        echo "=================================================="
-        echo "   K3S MANAGER v${VERSION}  --  interactive menu"
-        echo "=================================================="
-        echo "  Current role on this node: ${K3SMGR_ROLE:-not installed}"
-        echo
-        echo "  1) Install this node as the FIRST master (control-plane)"
-        echo "  2) Install this node as an additional HA master"
-        echo "  3) Install this node as a worker"
-        echo "  4) Show join token / info (run on a master)"
-        echo "  5) Status"
-        echo "  6) Diagnostics (doctor)"
-        echo "  7) Set up kubectl access (kubeconfig)"
-        echo "  8) Add a remote node over SSH"
-        echo "  9) Upgrade k3s on this node"
-        echo " 10) Update k3s-manager itself"
-        echo " 11) Network info / system info"
-        echo " 12) Uninstall k3s from this node"
-        echo " 13) AI: deploy Ollama across the cluster"
-        echo " 14) AI: install a model everywhere"
-        echo " 15) AI: status"
-        echo "  0) Exit"
-        echo
-        local choice
-        choice="$(ask "Choice" "0")"
-        case "$choice" in
-            1) menu_install_master ;;
-            2) menu_install_join_master ;;
-            3) menu_install_worker ;;
-            4) cmd_token ;;
-            5) cmd_status ;;
-            6) local fix=""; confirm "Auto-fix issues found?" n && fix="--fix"; cmd_doctor ${fix} ;;
-            7) cmd_kubeconfig ;;
-            8) local kind; kind="$(ask "Add as (worker/master)" "worker")"; local host; host="$(ask "SSH target (user@host)")"; local ifc; ifc="$(ask "Remote interface" "eth0")"; cmd_add_node "$kind" --ssh "$host" --interface "$ifc" ;;
-            9) cmd_upgrade ;;
-            10) cmd_update ;;
-            11) cmd_network_info; cmd_sysinfo ;;
-            12) cmd_uninstall ;;
-            13) ai_deploy ;;
-            14) local model; model="$(ask "Model name (e.g. llama3.2, qwen2.5:7b)")"; [[ -n "$model" ]] && ai_model_install "$model" ;;
-            15) ai_status ;;
-            0) echo "Bye."; return 0 ;;
-            *) echo "Invalid choice." ;;
-        esac
-    done
 }
 
 # ---------- system info ----------
@@ -2680,6 +2528,173 @@ cmd_ai() {
     esac
 }
 
+# ---------- interactive menu ----------
+
+pick_interface() {
+    local prompt="${1:-Select the interface k3s should bind to}"
+    echo "$prompt:" >&2
+    local -a names=()
+    local i=1 name cidr
+    while read -r name cidr; do
+        [[ -z "$name" ]] && continue
+        names+=("$name")
+        printf '  %d) %-10s %s\n' "$i" "$name" "$cidr" >&2
+        i=$((i + 1))
+    done < <(list_candidate_ifaces)
+    printf '  %d) %s\n' "$i" "skip (let k3s auto-select)" >&2
+
+    local choice
+    choice="$(ask "Choice" "1")"
+    if [[ "$choice" == "$i" ]]; then
+        echo ""
+        return 0
+    fi
+    if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice < i )); then
+        echo "${names[$((choice - 1))]}"
+        return 0
+    fi
+    # allow typing an interface name directly
+    echo "$choice"
+}
+
+random_token() {
+    if have openssl; then
+        openssl rand -hex 32
+    else
+        head -c48 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | head -c64
+    fi
+}
+
+menu_install_master() {
+    local ha=""
+    confirm "Enable HA (embedded etcd, allows multiple masters)?" n && ha="--ha"
+    local allow=""
+    confirm "Allow workloads to run on this master (useful for a single-node/small cluster)?" y && allow="--worker"
+
+    local iface
+    iface="$(pick_interface "Select the network interface for cluster traffic (e.g. your dedicated Ethernet NIC)")"
+
+    local channel
+    echo "Release channel: 1) stable  2) latest  3) testing  4) pin exact version"
+    local cchoice
+    cchoice="$(ask "Choice" "1")"
+    local version=""
+    case "$cchoice" in
+        1) channel="stable" ;;
+        2) channel="latest" ;;
+        3) channel="testing" ;;
+        4) channel=""; version="$(ask "Exact version (e.g. v1.31.4+k3s1)")" ;;
+        *) channel="stable" ;;
+    esac
+
+    local no_auto_san=""
+    if have tailscale && ! confirm "Include this node's Tailscale IP/hostname in the TLS certificate (recommended for remote kubectl access)?" y; then
+        no_auto_san="--no-auto-tls-san"
+    fi
+
+    local -a cmd_args=(install master)
+    [[ -n "$ha" ]] && cmd_args+=("$ha")
+    [[ -n "$allow" ]] && cmd_args+=("$allow")
+    [[ -n "$iface" ]] && cmd_args+=(--interface "$iface")
+    [[ -n "$channel" ]] && cmd_args+=(--channel "$channel")
+    [[ -n "$version" ]] && cmd_args+=(--version "$version")
+    [[ -n "$no_auto_san" ]] && cmd_args+=("$no_auto_san")
+    cmd_args+=(--yes)
+
+    echo
+    echo "About to run: $(basename "$SELF_PATH") ${cmd_args[*]}"
+    confirm "Proceed?" y || { echo "Cancelled."; return 0; }
+    cmd_install "master" "${cmd_args[@]:2}"
+}
+
+menu_install_worker() {
+    local server token
+    server="$(ask "Master API URL (e.g. https://10.50.0.1:6443)")"
+    [[ -n "$server" ]] || { echo "Server URL is required."; return 1; }
+    token="$(ask "Join token (from 'k3s-manager token' on the master)")"
+    [[ -n "$token" ]] || { echo "Token is required."; return 1; }
+
+    local iface
+    iface="$(pick_interface "Select the network interface for cluster traffic")"
+
+    local -a cmd_args=(--server "$server" --token "$token")
+    [[ -n "$iface" ]] && cmd_args+=(--interface "$iface")
+
+    echo
+    echo "About to join this node as a worker to ${server}"
+    confirm "Proceed?" y || { echo "Cancelled."; return 0; }
+    cmd_install "worker" "${cmd_args[@]}"
+}
+
+menu_install_join_master() {
+    local server token
+    server="$(ask "Existing master API URL (e.g. https://10.50.0.1:6443)")"
+    [[ -n "$server" ]] || { echo "Server URL is required."; return 1; }
+    token="$(ask "Join token")"
+    [[ -n "$token" ]] || { echo "Token is required."; return 1; }
+    local iface
+    iface="$(pick_interface "Select the network interface for cluster traffic")"
+
+    local -a cmd_args=(--server "$server" --token "$token")
+    [[ -n "$iface" ]] && cmd_args+=(--interface "$iface")
+
+    confirm "Proceed joining as an additional HA master?" y || { echo "Cancelled."; return 0; }
+    cmd_install "join-master" "${cmd_args[@]}"
+}
+
+cmd_menu() {
+    need_root
+    load_os
+    load_config
+
+    while true; do
+        echo
+        echo "=================================================="
+        echo "   K3S MANAGER v${VERSION}  --  interactive menu"
+        echo "=================================================="
+        echo "  Current role on this node: ${K3SMGR_ROLE:-not installed}"
+        echo
+        echo "  1) Install this node as the FIRST master (control-plane)"
+        echo "  2) Install this node as an additional HA master"
+        echo "  3) Install this node as a worker"
+        echo "  4) Show join token / info (run on a master)"
+        echo "  5) Status"
+        echo "  6) Diagnostics (doctor)"
+        echo "  7) Set up kubectl access (kubeconfig)"
+        echo "  8) Add a remote node over SSH"
+        echo "  9) Upgrade k3s on this node"
+        echo " 10) Update k3s-manager itself"
+        echo " 11) Network info / system info"
+        echo " 12) Uninstall k3s from this node"
+        echo " 13) AI: deploy Ollama across the cluster"
+        echo " 14) AI: install a model everywhere"
+        echo " 15) AI: status"
+        echo "  0) Exit"
+        echo
+        local choice
+        choice="$(ask "Choice" "0")"
+        case "$choice" in
+            1) menu_install_master ;;
+            2) menu_install_join_master ;;
+            3) menu_install_worker ;;
+            4) cmd_token ;;
+            5) cmd_status ;;
+            6) local fix=""; confirm "Auto-fix issues found?" n && fix="--fix"; cmd_doctor ${fix} ;;
+            7) cmd_kubeconfig ;;
+            8) local kind; kind="$(ask "Add as (worker/master)" "worker")"; local host; host="$(ask "SSH target (user@host)")"; local ifc; ifc="$(ask "Remote interface" "eth0")"; cmd_add_node "$kind" --ssh "$host" --interface "$ifc" ;;
+            9) cmd_upgrade ;;
+            10) cmd_update ;;
+            11) cmd_network_info; cmd_sysinfo ;;
+            12) cmd_uninstall ;;
+            13) ai_deploy ;;
+            14) local model; model="$(ask "Model name (e.g. llama3.2, qwen2.5:7b)")"; [[ -n "$model" ]] && ai_model_install "$model" ;;
+            15) ai_status ;;
+            0) echo "Bye."; return 0 ;;
+            *) echo "Invalid choice." ;;
+        esac
+    done
+}
+
 # ---------- help ----------
 
 cmd_help() {
@@ -2875,6 +2890,10 @@ main() {
 }
 
 main "$@"
+
+
+
+
 
 
 
