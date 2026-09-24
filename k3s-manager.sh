@@ -12,7 +12,7 @@ if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 3) ))
     exit 1
 fi
 
-VERSION="3.1.2"
+VERSION="3.1.9"
 REPO_RAW_URL="${K3SMGR_REPO_RAW_URL:-https://raw.githubusercontent.com/Codemanhtmlpythoncss/K3s-manager/main/k3s-manager.sh}"
 SELF_PATH="$(command -v -- "$0" 2>/dev/null || readlink -f -- "$0" 2>/dev/null || echo "$0")"
 CONFIG_DIR="/etc/k3s-manager"
@@ -259,6 +259,21 @@ load_config() {
         # shellcheck disable=SC1090
         . "$CONFIG_FILE"
     fi
+
+    # No saved role (e.g. an earlier install failed before saving): infer it
+    # from what the k3s installer actually put on disk.
+    if [[ -z "${K3SMGR_ROLE:-}" ]]; then
+        if [[ -f /etc/systemd/system/k3s-agent.service || -x /usr/local/bin/k3s-agent-uninstall.sh ]]; then
+            K3SMGR_ROLE="worker"
+        elif [[ -f /etc/systemd/system/k3s.service || -x /usr/local/bin/k3s-uninstall.sh ]]; then
+            K3SMGR_ROLE="master"
+        fi
+    fi
+
+    if [[ "${K3SMGR_ROLE:-}" == "worker" && -z "${K3SMGR_SERVER_URL:-}" && -r /etc/systemd/system/k3s-agent.service.env ]]; then
+        K3SMGR_SERVER_URL="$(sed -n "s/^K3S_URL=['\"]\{0,1\}\([^'\"]*\)['\"]\{0,1\}$/\1/p" /etc/systemd/system/k3s-agent.service.env | head -n1 || true)"
+    fi
+    return 0
 }
 
 # ---------- network helpers ----------
@@ -379,8 +394,11 @@ build_network_args() {
         ipaddr="$(validate_interface "$iface")"
 
         NETWORK_ARGS=("--node-ip" "$ipaddr" "--flannel-iface" "$iface")
-        [[ "$mode" == "server" ]] && NETWORK_ARGS+=("--advertise-address" "$ipaddr")
+        if [[ "$mode" == "server" ]]; then
+            NETWORK_ARGS+=("--advertise-address" "$ipaddr")
+        fi
     fi
+    return 0
 }
 
 # builds a --tls-san list: explicit SANs + (optionally) hostname + tailscale IP
@@ -410,8 +428,11 @@ build_tls_san_args() {
         add_san "$(hostname -f 2>/dev/null || hostname)"
         local tsip
         tsip="$(tailscale_ip || true)"
-        [[ -n "$tsip" ]] && add_san "$tsip"
+        if [[ -n "$tsip" ]]; then
+            add_san "$tsip"
+        fi
     fi
+    return 0
 }
 
 # ---------- prerequisites ----------
@@ -436,7 +457,7 @@ pkg_install() {
             retry 3 5 run zypper --non-interactive install "${pkgs[@]}" || warn "Some packages failed to install: ${pkgs[*]}"
             ;;
         pacman)
-            retry 3 5 run pacman -Sy --noconfirm --needed "${pkgs[@]}" || warn "Some packages failed to install: ${pkgs[*]}"
+            retry 3 5 run pacman -S --noconfirm --needed "${pkgs[@]}" || warn "Some packages failed to install: ${pkgs[*]} (run a full 'pacman -Syu' first if your package database is stale)"
             ;;
         apk)
             retry 3 5 run apk add --no-cache "${pkgs[@]}" || warn "Some packages failed to install: ${pkgs[*]}"
@@ -472,8 +493,10 @@ install_prereqs() {
             pkg_install curl ca-certificates nfs-client socat conntrack-tools open-iscsi iptables
             ;;
         pacman)
-            run pacman -Sy --noconfirm 2>/dev/null || true
-            pkg_install curl ca-certificates nfs-utils socat conntrack-tools open-iscsi iptables
+            # No -Sy here: syncing without upgrading is an Arch "partial upgrade".
+            # iptables is omitted because it conflicts with Arch's default iptables-nft
+            # (k3s ships its own iptables binaries anyway).
+            pkg_install curl ca-certificates nfs-utils socat conntrack-tools open-iscsi
             ;;
         apk)
             pkg_install curl ca-certificates nfs-utils socat conntrack-tools open-iscsi iptables
@@ -494,7 +517,7 @@ install_prereqs() {
 fix_kernel_modules() {
     local mod
     for mod in overlay br_netfilter; do
-        if ! lsmod 2>/dev/null | grep -q "^${mod}"; then
+        if ! grep -q "^${mod} " <<<"$(lsmod 2>/dev/null || true)"; then
             run modprobe "$mod" 2>/dev/null || warn "Could not load kernel module '$mod' (may be built-in, which is fine)."
         fi
     done
@@ -511,10 +534,6 @@ fix_sysctl() {
 net.ipv4.ip_forward = 1
 net.bridge.bridge-nf-call-iptables = 1
 net.bridge.bridge-nf-call-ip6tables = 1
-vm.panic_on_oom = 0
-vm.overcommit_memory = 1
-kernel.panic = 10
-kernel.panic_on_oops = 1
 SYSCTL
     run sysctl --system >/dev/null 2>&1 || warn "sysctl --system reported issues; some settings may not have applied."
 }
@@ -527,8 +546,11 @@ check_swap() {
         return 0
     fi
 
-    warn "Swap is enabled. K3s strongly prefers swap disabled (kubelet may refuse to start on some versions)."
-    if [[ "$ASSUME_YES" -eq 1 ]] || confirm "Disable swap now and comment it out of /etc/fstab?" n; then
+    # k3s runs kubelet with fail-swap-on=false, so swap is fine. Never turn it
+    # off persistently just because --yes was passed: on a laptop that can
+    # break hibernation. Only do it when a human explicitly says yes.
+    info "Swap is enabled. k3s runs fine with swap on, so it is being left alone."
+    if [[ "$NONINTERACTIVE" -eq 0 && "$ASSUME_YES" -eq 0 ]] && confirm "Disable swap anyway and comment it out of /etc/fstab?" n; then
         run swapoff -a || warn "swapoff failed."
         if [[ -f /etc/fstab ]]; then
             cp -a /etc/fstab "/etc/fstab.k3s-manager.bak.$(date +%s)" 2>/dev/null || true
@@ -536,34 +558,33 @@ check_swap() {
                 warn "Could not edit /etc/fstab automatically; comment out swap entries manually."
         fi
         ok "Swap disabled."
-    else
-        warn "Leaving swap enabled at your request. If the kubelet fails to start, re-run: sudo $(basename "$SELF_PATH") doctor --fix"
     fi
+    return 0
 }
 
 check_time_sync() {
     local svc
-    for svc in systemd-timesyncd chronyd chrony ntpd; do
-        if systemctl list-unit-files 2>/dev/null | grep -q "^${svc}\.service"; then
-            if systemctl is-active --quiet "$svc" 2>/dev/null; then
-                vlog "Time sync service active: $svc"
-                return 0
-            fi
+    for svc in systemd-timesyncd chronyd chrony ntpd ntpsec openntpd; do
+        if systemctl is-active --quiet "$svc" 2>/dev/null; then
+            vlog "Time sync service active: $svc"
+            return 0
         fi
     done
     warn "No active time-sync service detected (systemd-timesyncd/chrony/ntpd). Clock drift can break TLS between nodes."
+    return 0
 }
 
 # ---------- firewall ----------
 
 detect_firewall() {
-    if have ufw && ufw status 2>/dev/null | grep -qi "^Status: active"; then
+    local out=""
+    if have ufw && grep -qi "^Status: active" <<<"$(ufw status 2>/dev/null || true)"; then
         echo "ufw"
     elif have firewall-cmd && systemctl is-active --quiet firewalld 2>/dev/null; then
         echo "firewalld"
-    elif have nft && nft list ruleset 2>/dev/null | grep -q .; then
+    elif have nft && [[ -n "$(nft list ruleset 2>/dev/null || true)" ]]; then
         echo "nftables"
-    elif have iptables && iptables -S 2>/dev/null | grep -qv '^-P .* ACCEPT$'; then
+    elif have iptables && out="$(iptables -S 2>/dev/null || true)" && [[ -n "$out" ]] && grep -qv '^-P .* ACCEPT$' <<<"$out"; then
         echo "iptables"
     else
         echo "none"
@@ -614,8 +635,8 @@ cmd_firewall() {
     case "$action" in
         status)
             echo "Detected backend: $(detect_firewall)"
-            have ufw && { echo; ufw status verbose 2>/dev/null; }
-            have firewall-cmd && { echo; firewall-cmd --list-all 2>/dev/null; }
+            if have ufw; then echo; ufw status verbose 2>/dev/null || true; fi
+            if have firewall-cmd; then echo; firewall-cmd --list-all 2>/dev/null || true; fi
             ;;
         open)
             load_config
@@ -623,13 +644,14 @@ cmd_firewall() {
             ;;
         disable)
             confirm "Disable the host firewall entirely? This reduces security." n || { echo "Aborted."; return 0; }
-            have ufw && run ufw disable
-            have firewall-cmd && run systemctl stop firewalld
+            if have ufw; then run ufw disable; fi
+            if have firewall-cmd; then run systemctl stop firewalld; fi
             ;;
         *)
             die "Usage: k3s-manager firewall {status|open|disable}"
             ;;
     esac
+    return 0
 }
 
 # ---------- coexistence with other host services (e.g. Nextcloud) ----------
@@ -638,9 +660,9 @@ cmd_firewall() {
 port_in_use() {
     local port="$1"
     if have ss; then
-        ss -ltn 2>/dev/null | awk 'NR>1{print $4}' | grep -qE "[.:]${port}\$"
+        grep -qE "[.:]${port}\$" <<<"$(ss -ltn 2>/dev/null | awk 'NR>1{print $4}' || true)"
     elif have netstat; then
-        netstat -ltn 2>/dev/null | awk 'NR>2{print $4}' | grep -qE "[.:]${port}\$"
+        grep -qE "[.:]${port}\$" <<<"$(netstat -ltn 2>/dev/null | awk 'NR>2{print $4}' || true)"
     else
         (exec 3<>"/dev/tcp/127.0.0.1/${port}") 2>/dev/null && { exec 3>&-; return 0; } || return 1
     fi
@@ -651,16 +673,16 @@ port_in_use() {
 detect_nextcloud() {
     local found=0 how=""
 
-    if have snap && snap list 2>/dev/null | grep -qi '^nextcloud '; then
+    if have snap && grep -qi '^nextcloud ' <<<"$(snap list 2>/dev/null || true)"; then
         found=1; how="snap package 'nextcloud'"
     fi
-    if have docker && docker ps --format '{{.Names}} {{.Image}}' 2>/dev/null | grep -qi 'nextcloud'; then
+    if have docker && grep -qi 'nextcloud' <<<"$(docker ps --format '{{.Names}} {{.Image}}' 2>/dev/null || true)"; then
         found=1; how="${how:+$how, }a running Docker container"
     fi
     if [[ -d /var/www/nextcloud || -d /var/www/html/nextcloud ]]; then
         found=1; how="${how:+$how, }a web root at /var/www*/nextcloud"
     fi
-    if systemctl list-units --type=service --all 2>/dev/null | grep -qi nextcloud; then
+    if grep -qi nextcloud <<<"$(systemctl list-units --type=service --all 2>/dev/null || true)"; then
         found=1; how="${how:+$how, }a systemd service"
     fi
 
@@ -722,6 +744,64 @@ fix_forward_policy() {
     fi
 }
 
+# memory_cgroup_available -- kubelet (inside k3s) requires the memory cgroup
+# controller. Some kernels (notably Raspberry Pi OS and other minimal ARM
+# images) ship with it disabled by default, which makes k3s/k3s-agent fail
+# immediately on start -- the official k3s installer itself warns about this.
+memory_cgroup_available() {
+    [[ -d /sys/fs/cgroup/memory ]] && return 0
+    [[ -r /sys/fs/cgroup/cgroup.controllers ]] && grep -qw memory /sys/fs/cgroup/cgroup.controllers 2>/dev/null && return 0
+    return 1
+}
+
+# fix_memory_cgroup -- edits the kernel command line to enable it. This only
+# takes effect after a reboot, so it deliberately does NOT claim to be an
+# immediate fix like the other doctor checks.
+fix_memory_cgroup() {
+    local params="cgroup_memory=1 cgroup_enable=memory"
+    echo "    Current kernel cmdline: $(cat /proc/cmdline 2>/dev/null)"
+
+    if grep -qw 'cgroup_memory=1' /proc/cmdline 2>/dev/null; then
+        warn "The running kernel already has cgroup_memory=1 but the controller is still missing -- check for 'cgroup_disable=memory' later on the line, or a kernel built without CONFIG_MEMCG."
+        return 1
+    fi
+
+    local cmdline_file="" f
+    for f in /boot/firmware/cmdline.txt /boot/cmdline.txt; do
+        [[ -f "$f" ]] && { cmdline_file="$f"; break; }
+    done
+
+    if [[ -n "$cmdline_file" ]]; then
+        if grep -q 'cgroup_memory=1' "$cmdline_file" 2>/dev/null; then
+            warn "${cmdline_file} already has cgroup_memory=1 -- it just hasn't taken effect yet. Reboot: sudo reboot"
+            return 0
+        fi
+        cp -a "$cmdline_file" "${cmdline_file}.k3s-manager.bak.$(date +%s)" 2>/dev/null || true
+        # The Pi bootloader only reads the FIRST line of cmdline.txt.
+        run sed -i "1 s/\$/ ${params}/" "$cmdline_file"
+        ok "Added '${params}' to ${cmdline_file} (backup saved alongside)."
+        echo "    $(c_yellow "A REBOOT is required for this to take effect:") sudo reboot"
+        return 0
+    fi
+
+    if [[ -f /etc/default/grub ]] && have update-grub; then
+        if grep -q 'cgroup_memory=1' /etc/default/grub 2>/dev/null; then
+            warn "/etc/default/grub already has cgroup_memory=1 -- run 'sudo update-grub' if you haven't, then reboot."
+            return 0
+        fi
+        cp -a /etc/default/grub "/etc/default/grub.k3s-manager.bak.$(date +%s)" 2>/dev/null || true
+        run sed -i "s/^GRUB_CMDLINE_LINUX=\"\(.*\)\"/GRUB_CMDLINE_LINUX=\"\1 ${params}\"/" /etc/default/grub
+        run update-grub
+        ok "Added '${params}' to GRUB_CMDLINE_LINUX and ran update-grub (backup saved alongside)."
+        echo "    $(c_yellow "A REBOOT is required for this to take effect:") sudo reboot"
+        return 0
+    fi
+
+    warn "Couldn't find /boot/firmware/cmdline.txt, /boot/cmdline.txt, or GRUB to edit automatically."
+    echo "    Add '${params}' to your bootloader's kernel command line manually, then reboot."
+    return 1
+}
+
 # ---------- kubectl wrapper ----------
 
 kctl() {
@@ -761,7 +841,7 @@ wait_for_node_ready() {
     local node="${1:-$(hostname)}"
     local tries=0 max_tries=60
     while (( tries < max_tries )); do
-        if kctl get node "$node" --no-headers 2>/dev/null | awk '{print $2}' | grep -qw Ready; then
+        if grep -qw Ready <<<"$(kctl get node "$node" --no-headers 2>/dev/null | awk '{print $2}' || true)"; then
             return 0
         fi
         sleep 3
@@ -926,6 +1006,20 @@ install_server() {
     [[ -n "$token" ]] && env_assign+=("K3S_TOKEN=${token}")
     env_assign+=("${INSTALL_ENV_ARGS[@]+"${INSTALL_ENV_ARGS[@]}"}")
 
+    local node_ip
+    if [[ -n "$iface" ]]; then
+        node_ip="$(validate_interface "$iface")"
+    else
+        node_ip="$(best_ip)"
+    fi
+    [[ -n "$node_ip" ]] || die "Could not determine the server IPv4 address."
+    local server_url="https://${node_ip}:6443"
+
+    # Save role/config BEFORE attempting the actual install, so that if the
+    # service fails to come up, 'doctor'/'status' on this node still know
+    # it's meant to be a server (not a worker) and check k3s accordingly.
+    save_config "master" "$iface" "$node_ip" "$server_url" "$channel" "$tls_san_csv"
+
     info "Installing K3s server (channel=${channel:-default} version=${version:-default})..."
     [[ -x /usr/local/bin/k3s ]] && info "K3s binary already present; installer will reconcile the existing service."
 
@@ -936,18 +1030,7 @@ install_server() {
         run systemctl restart k3s
     fi
 
-    wait_for_k3s k3s || die "k3s.service did not become active. Check: sudo journalctl -u k3s -xe"
-
-    local node_ip
-    if [[ -n "$iface" ]]; then
-        node_ip="$(validate_interface "$iface")"
-    else
-        node_ip="$(best_ip)"
-    fi
-    [[ -n "$node_ip" ]] || die "Could not determine the server IPv4 address."
-
-    local server_url="https://${node_ip}:6443"
-    save_config "master" "$iface" "$node_ip" "$server_url" "$channel" "$tls_san_csv"
+    wait_for_k3s k3s || die "k3s.service did not become active. Check: sudo journalctl -u k3s -xe / sudo k3s-manager doctor"
 
     open_k3s_ports "server"
 
@@ -978,7 +1061,7 @@ install_server() {
 install_worker() {
     need_root
 
-    local server="" token="" iface=""
+    local server="" token="" iface="" channel="" version=""
     local -a node_labels=() node_taints=()
 
     while [[ $# -gt 0 ]]; do
@@ -986,6 +1069,8 @@ install_worker() {
             --server) [[ $# -ge 2 ]] || die "--server requires a URL."; server="$2"; shift 2 ;;
             --token) [[ $# -ge 2 ]] || die "--token requires a value."; token="$2"; shift 2 ;;
             --interface) [[ $# -ge 2 ]] || die "--interface requires an interface."; iface="$2"; shift 2 ;;
+            --channel) [[ $# -ge 2 ]] || die "--channel requires a value."; channel="$2"; shift 2 ;;
+            --version) [[ $# -ge 2 ]] || die "--version requires a value (use the server's, e.g. v1.36.4+k3s1)."; version="$2"; shift 2 ;;
             --node-label) [[ $# -ge 2 ]] || die "--node-label requires K=V."; node_labels+=("--node-label" "$2"); shift 2 ;;
             --node-taint) [[ $# -ge 2 ]] || die "--node-taint requires K=V:Effect."; node_taints+=("--node-taint" "$2"); shift 2 ;;
             --yes|-y) ASSUME_YES=1; shift ;;
@@ -998,7 +1083,28 @@ install_worker() {
 
     preflight_join "$server"
     install_prereqs
+
+    if [[ -z "$iface" ]]; then
+        local server_host
+        server_host="$(sed -E 's#^https?://##; s#[:/].*$##' <<<"$server")"
+        iface="$(ip -4 route get "$server_host" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}' || true)"
+        if [[ -n "$iface" ]]; then
+            info "No --interface given; using '${iface}', the interface that routes to ${server_host}."
+        fi
+    fi
     build_network_args "$iface" "agent"
+
+    local node_ip
+    if [[ -n "$iface" ]]; then
+        node_ip="$(validate_interface "$iface")"
+    else
+        node_ip="$(best_ip)"
+    fi
+
+    # Save role/config BEFORE attempting the actual join, so that if the
+    # service fails to come up, 'doctor'/'status' on this node still know
+    # it's meant to be a worker and check k3s-agent (not k3s) accordingly.
+    save_config "worker" "$iface" "$node_ip" "$server"
 
     local -a args=("agent")
     [[ "${#NETWORK_ARGS[@]}" -gt 0 ]] && args+=("${NETWORK_ARGS[@]}")
@@ -1008,8 +1114,10 @@ install_worker() {
     local exec_string
     exec_string="$(exec_string_from_args args)"
     local -a env_assign=("K3S_URL=${server}" "K3S_TOKEN=${token}" "INSTALL_K3S_EXEC=${exec_string}")
+    resolve_install_env "$channel" "$version"
+    env_assign+=("${INSTALL_ENV_ARGS[@]+"${INSTALL_ENV_ARGS[@]}"}")
 
-    info "Joining worker to ${server}..."
+    info "Joining worker to ${server} (k3s ${version:-${channel:-stable channel}})..."
     run_k3s_installer env_assign
 
     if [[ "$INIT" == "systemd" ]]; then
@@ -1017,16 +1125,8 @@ install_worker() {
         run systemctl restart k3s-agent
     fi
 
-    wait_for_k3s k3s-agent || die "k3s-agent.service did not become active. Check: sudo journalctl -u k3s-agent -xe"
+    wait_for_k3s k3s-agent || die "k3s-agent.service did not become active. Check: sudo journalctl -u k3s-agent -xe / sudo k3s-manager doctor"
 
-    local node_ip
-    if [[ -n "$iface" ]]; then
-        node_ip="$(validate_interface "$iface")"
-    else
-        node_ip="$(best_ip)"
-    fi
-
-    save_config "worker" "$iface" "$node_ip" "$server"
     open_k3s_ports "agent"
     ok "Worker installed and joined to ${server}."
 }
@@ -1064,6 +1164,18 @@ install_join_master() {
     exec_string="$(exec_string_from_args args)"
     local -a env_assign=("INSTALL_K3S_EXEC=${exec_string}" "K3S_TOKEN=${token}")
 
+    local node_ip
+    if [[ -n "$iface" ]]; then
+        node_ip="$(validate_interface "$iface")"
+    else
+        node_ip="$(best_ip)"
+    fi
+
+    # Save role/config BEFORE attempting the actual join, so that if the
+    # service fails to come up, 'doctor'/'status' on this node still know
+    # it's meant to be a server (not a worker) and check k3s accordingly.
+    save_config "master" "$iface" "$node_ip" "$server" "" "$tls_san_csv"
+
     info "Joining HA server to ${server}..."
     run_k3s_installer env_assign
 
@@ -1072,16 +1184,8 @@ install_join_master() {
         run systemctl restart k3s
     fi
 
-    wait_for_k3s k3s || die "k3s.service did not become active. Check: sudo journalctl -u k3s -xe"
+    wait_for_k3s k3s || die "k3s.service did not become active. Check: sudo journalctl -u k3s -xe / sudo k3s-manager doctor"
 
-    local node_ip
-    if [[ -n "$iface" ]]; then
-        node_ip="$(validate_interface "$iface")"
-    else
-        node_ip="$(best_ip)"
-    fi
-
-    save_config "master" "$iface" "$node_ip" "$server" "" "$tls_san_csv"
     open_k3s_ports "server"
     ok "HA master joined successfully."
 }
@@ -1394,59 +1498,95 @@ ssh_preflight() {
 
 cmd_add_node() {
     need_root
+    load_config
 
     local kind="${1:-}"
     shift || true
 
-    local ssh_target="" iface="eth0"
+    local ssh_target="" iface="" version=""
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --ssh) [[ $# -ge 2 ]] || die "--ssh requires user@host."; ssh_target="$2"; shift 2 ;;
             --interface) [[ $# -ge 2 ]] || die "--interface requires an interface."; iface="$2"; shift 2 ;;
+            --version) [[ $# -ge 2 ]] || die "--version requires a value."; version="$2"; shift 2 ;;
             *) die "Unknown add-node option: $1" ;;
         esac
     done
 
+    local role_cmd
+    case "$kind" in
+        worker) role_cmd="install worker" ;;
+        master) role_cmd="install join-master" ;;
+        *) die "Usage: k3s-manager add-node {worker|master} [--ssh user@host] [--interface IFACE] [--version V]" ;;
+    esac
+
     [[ -r "$K3S_TOKEN_FILE" ]] ||
         die "This command must be run on a K3s server."
 
-    local master_ip
-    master_ip="$(best_ip)"
+    # Use the address this server was installed on (its --interface IP), not the
+    # default-routed one -- on multi-homed nodes the default route is usually Wi-Fi.
+    local master_ip="${K3SMGR_NODE_IP:-}"
+    if [[ -z "$master_ip" ]] && kctl_available; then
+        master_ip="$(kctl get node "$(hostname)" -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}' 2>/dev/null || true)"
+    fi
+    [[ -n "$master_ip" ]] || master_ip="$(best_ip)"
+    info "Workers will join via https://${master_ip}:6443"
     [[ -n "$master_ip" ]] || die "Could not determine master IP."
+
+    # A node must never run a newer k3s than the server, so default to ours.
+    if [[ -z "$version" ]]; then
+        version="$(/usr/local/bin/k3s --version 2>/dev/null | awk '/k3s version/{print $3; exit}' || true)"
+    fi
 
     local token
     token="$(cat "$K3S_TOKEN_FILE")"
-
     local server="https://${master_ip}:6443"
-    local remote_cmd
 
-    case "$kind" in
-        worker)
-            remote_cmd="curl -sfL ${REPO_RAW_URL} -o /tmp/k3s-manager.sh && sudo bash /tmp/k3s-manager.sh install worker --server $(printf '%q' "$server") --token $(printf '%q' "$token") --interface $(printf '%q' "$iface") --yes"
-            ;;
-        master)
-            remote_cmd="curl -sfL ${REPO_RAW_URL} -o /tmp/k3s-manager.sh && sudo bash /tmp/k3s-manager.sh install join-master --server $(printf '%q' "$server") --token $(printf '%q' "$token") --interface $(printf '%q' "$iface") --yes"
-            ;;
-        *)
-            die "Usage: k3s-manager add-node {worker|master} [--ssh user@host] [--interface eth0]"
-            ;;
-    esac
+    # --interface is optional: 'install worker' picks whichever NIC routes to the server.
+    local -a args=(--server "$server" --token "$token")
+    [[ -n "$iface" ]] && args+=(--interface "$iface")
+    [[ -n "$version" && "$kind" == "worker" ]] && args+=(--version "$version")
 
-    if [[ -n "$ssh_target" ]]; then
-        ssh_preflight "$ssh_target"
-        info "Running remote install on ${ssh_target}..."
-        if ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 "$ssh_target" "$remote_cmd"; then
-            ok "Node joined via ${ssh_target}."
-        else
-            die "Remote install over SSH failed. Re-run with the printed command manually to see full output, or check 'sudo $(basename "$SELF_PATH") doctor' on the remote node."
-        fi
+    local remote_args="" a
+    for a in "${args[@]}"; do
+        remote_args+=" $(printf '%q' "$a")"
+    done
+
+    if [[ -z "$ssh_target" ]]; then
+        echo "Copy this script to the target node (e.g. scp $(printf '%q' "$SELF_PATH") user@host:/tmp/k3s-manager.sh), then run there:"
+        echo
+        echo "  sudo install -m 755 /tmp/k3s-manager.sh /usr/local/bin/k3s-manager && sudo k3s-manager ${role_cmd}${remote_args}"
+        echo
+        echo "...or re-run with --ssh user@host to have k3s-manager do all of that for you."
+        return 0
+    fi
+
+    ssh_preflight "$ssh_target"
+
+    # One shared connection: the target's SSH password is asked for once and
+    # reused for the copy and the install.
+    local -a sshopts=(-o StrictHostKeyChecking=accept-new -o ConnectTimeout=10
+                      -o ControlMaster=auto -o "ControlPath=/tmp/k3smgr-add-%C" -o ControlPersist=300)
+
+    info "Connecting to ${ssh_target} (enter its SSH password if asked)..."
+    ssh "${sshopts[@]}" -fN "$ssh_target" || die "Could not connect to ${ssh_target}."
+
+    info "Copying k3s-manager ${VERSION} to ${ssh_target}..."
+    scp "${sshopts[@]}" -q "$SELF_PATH" "${ssh_target}:/tmp/k3s-manager.sh" ||
+        die "Could not copy k3s-manager to ${ssh_target}."
+
+    local remote_cmd="sudo install -m 755 /tmp/k3s-manager.sh /usr/local/bin/k3s-manager && sudo /usr/local/bin/k3s-manager -y ${role_cmd}${remote_args}; rc=\$?; rm -f /tmp/k3s-manager.sh; exit \$rc"
+
+    info "Running '${role_cmd}' on ${ssh_target} (enter its sudo password if asked)..."
+    local rc=0
+    ssh "${sshopts[@]}" -t "$ssh_target" "$remote_cmd" || rc=$?
+    ssh "${sshopts[@]}" -O exit "$ssh_target" >/dev/null 2>&1 || true
+
+    if [[ "$rc" -eq 0 ]]; then
+        ok "${ssh_target} joined the cluster as a ${kind}."
     else
-        echo "This node does not have k3s-manager pre-installed remotely, so run this ON THE TARGET NODE:"
-        echo
-        echo "  $remote_cmd"
-        echo
-        echo "...or re-run with --ssh user@host to have k3s-manager do it for you over SSH."
+        die "Remote install on ${ssh_target} failed (exit ${rc}). Run 'sudo k3s-manager doctor' on that node."
     fi
 }
 
@@ -1589,7 +1729,9 @@ doctor_check() {
             echo "    (re-run with 'doctor --fix' to apply automatically)"
         fi
     fi
-    return 1
+    # Issues are tallied in DOCTOR_ISSUES; returning non-zero here would make
+    # `set -e` abort doctor at the first problem it finds.
+    return 0
 }
 
 cmd_doctor() {
@@ -1617,12 +1759,28 @@ cmd_doctor() {
 
     echo
     echo "-- Host requirements --"
-    doctor_check "swap disabled" '[[ -z "$(swapon --noheadings 2>/dev/null)" ]]' "swapoff -a"
-    doctor_check "br_netfilter loaded" 'lsmod 2>/dev/null | grep -q "^br_netfilter"' "modprobe br_netfilter"
-    doctor_check "overlay loaded" 'lsmod 2>/dev/null | grep -q "^overlay"' "modprobe overlay"
+    if [[ -n "$(swapon --noheadings 2>/dev/null || true)" ]]; then
+        printf '%-60s%s\n' "  swap..." "on (fine -- k3s runs kubelet with fail-swap-on=false)"
+    fi
+    doctor_check "br_netfilter loaded" 'grep -q "^br_netfilter " <<<"$(lsmod 2>/dev/null || true)"' "modprobe br_netfilter"
+    doctor_check "overlay loaded" 'grep -q "^overlay " <<<"$(lsmod 2>/dev/null || true)"' "modprobe overlay"
     doctor_check "ip_forward enabled" '[[ "$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)" == "1" ]]' "sysctl -w net.ipv4.ip_forward=1"
     doctor_check "time sync service active" 'systemctl is-active --quiet systemd-timesyncd 2>/dev/null || systemctl is-active --quiet chronyd 2>/dev/null || systemctl is-active --quiet chrony 2>/dev/null || systemctl is-active --quiet ntpd 2>/dev/null'
     doctor_check "/var free space > 1GiB" '[[ $(df --output=avail -B1 /var 2>/dev/null | tail -1) -gt 1073741824 ]]'
+
+    printf '%-60s' "  memory cgroup controller available..."
+    if memory_cgroup_available; then
+        echo "$(c_green OK)"
+    else
+        echo "$(c_red "ISSUE")"
+        DOCTOR_ISSUES=$((DOCTOR_ISSUES + 1))
+        warn "kubelet (inside k3s) requires the memory cgroup controller; without it, k3s/k3s-agent typically fails immediately on start ('control process exited with error code')."
+        if [[ "$DOCTOR_FIX" -eq 1 ]]; then
+            fix_memory_cgroup || true
+        else
+            echo "    Re-run with 'doctor --fix' to have the kernel cmdline edited automatically (a reboot will still be required afterward)."
+        fi
+    fi
 
     echo
     echo "-- Networking --"
@@ -1664,7 +1822,7 @@ cmd_doctor() {
         echo
         echo "-- Cluster state --"
         doctor_check "API server responds" "kctl get --raw=/healthz >/dev/null 2>&1"
-        doctor_check "this node is Ready" "kctl get node \"\$(hostname)\" --no-headers 2>/dev/null | awk '{print \$2}' | grep -qw Ready"
+        doctor_check "this node is Ready" "grep -qw Ready <<<\"\$(kctl get node \"\$(hostname)\" --no-headers 2>/dev/null | awk '{print \$2}' || true)\""
         local notready
         notready="$(kctl get nodes --no-headers 2>/dev/null | awk '$2 !~ /Ready/{print $1}' || true)"
         if [[ -n "$notready" ]]; then
@@ -1683,8 +1841,11 @@ cmd_doctor() {
         ok "No issues found."
     else
         echo "$(c_yellow "Found ${DOCTOR_ISSUES} issue(s).")"
-        [[ "$DOCTOR_FIX" -eq 0 ]] && echo "Re-run: sudo $(basename "$SELF_PATH") doctor --fix"
+        if [[ "$DOCTOR_FIX" -eq 0 ]]; then
+            echo "Re-run: sudo $(basename "$SELF_PATH") doctor --fix"
+        fi
     fi
+    return 0
 }
 
 # ---------- watchdog (failover monitor) ----------
@@ -1959,10 +2120,10 @@ cmd_sysinfo() {
     fi
 
     if have nvidia-smi && nvidia-smi -L >/dev/null 2>&1; then
-        gpu="NVIDIA -- $(nvidia-smi -L 2>/dev/null | head -n1)"
-    elif have lspci && lspci 2>/dev/null | grep -qi nvidia; then
+        gpu="NVIDIA -- $(nvidia-smi -L 2>/dev/null | head -n1 || true)"
+    elif have lspci && grep -qi nvidia <<<"$(lspci 2>/dev/null || true)"; then
         gpu="NVIDIA GPU present, but nvidia-smi/driver not found (CPU-only until drivers are installed)"
-    elif have lspci && lspci 2>/dev/null | grep -Eqi 'vga.*amd|display.*amd|3d.*amd'; then
+    elif have lspci && grep -Eqi 'vga.*amd|display.*amd|3d.*amd' <<<"$(lspci 2>/dev/null || true)"; then
         gpu="AMD GPU present (ROCm support varies by model; CPU fallback otherwise)"
     fi
 
@@ -2313,7 +2474,7 @@ ai_undeploy() {
     if [[ "$keep_labels" -eq 0 ]]; then
         local name
         while read -r name; do
-            [[ -n "$name" ]] && kctl label node "$name" k3smgr.io/ai- >/dev/null 2>&1
+            if [[ -n "$name" ]]; then kctl label node "$name" k3smgr.io/ai- >/dev/null 2>&1 || true; fi
         done < <(kctl get nodes -l k3smgr.io/ai=true -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null)
     fi
 
@@ -2345,12 +2506,12 @@ ai_status() {
         done < <(ai_model_pods)
     fi
 
-    if have ollama || systemctl list-unit-files 2>/dev/null | grep -q '^ollama\.service'; then
+    if have ollama || systemctl cat ollama.service >/dev/null 2>&1; then
         shown=1
         echo
         echo "=== LOCAL OLLAMA (this node) ==="
         systemctl --no-pager --full status ollama 2>/dev/null || true
-        have ollama && ollama list 2>/dev/null
+        if have ollama; then ollama list 2>/dev/null || true; fi
     fi
 
     if [[ "$shown" -eq 0 ]]; then
@@ -2610,9 +2771,9 @@ menu_install_master() {
 menu_install_worker() {
     local server token
     server="$(ask "Master API URL (e.g. https://10.50.0.1:6443)")"
-    [[ -n "$server" ]] || { echo "Server URL is required."; return 1; }
+    [[ -n "$server" ]] || { echo "Server URL is required."; return 0; }
     token="$(ask "Join token (from 'k3s-manager token' on the master)")"
-    [[ -n "$token" ]] || { echo "Token is required."; return 1; }
+    [[ -n "$token" ]] || { echo "Token is required."; return 0; }
 
     local iface
     iface="$(pick_interface "Select the network interface for cluster traffic")"
@@ -2629,9 +2790,9 @@ menu_install_worker() {
 menu_install_join_master() {
     local server token
     server="$(ask "Existing master API URL (e.g. https://10.50.0.1:6443)")"
-    [[ -n "$server" ]] || { echo "Server URL is required."; return 1; }
+    [[ -n "$server" ]] || { echo "Server URL is required."; return 0; }
     token="$(ask "Join token")"
-    [[ -n "$token" ]] || { echo "Token is required."; return 1; }
+    [[ -n "$token" ]] || { echo "Token is required."; return 0; }
     local iface
     iface="$(pick_interface "Select the network interface for cluster traffic")"
 
@@ -2721,6 +2882,7 @@ INSTALL
                                         [--tls-san HOST]...
 
   sudo k3s-manager install worker --server URL --token T [--interface eth0]
+                                   [--version vX.Y.Z+k3sN | --channel C]
                                    [--node-label K=V]... [--node-taint K=V:Effect]...
 
 LIFECYCLE
